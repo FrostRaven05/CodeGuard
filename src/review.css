@@ -1,0 +1,246 @@
+.review-panel {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+.review-heading,
+.review-heading h2,
+.review-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.review-heading {
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.review-heading h2 svg {
+  color: var(--purple);
+}
+.field-help {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.review-options {
+  margin: 14px 0;
+}
+.review-options summary,
+.advanced-settings summary,
+.review-coverage summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #b4bed0;
+  line-height: 1.7;
+}
+.review-options summary span {
+  margin-left: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.review-options label,
+.settings-form label,
+.manual-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 14px 0 8px;
+  font-size: 12px;
+}
+.review-options textarea,
+.settings-form textarea,
+.settings-form input:not([type='checkbox']),
+.manual-copy textarea {
+  width: 100%;
+  color: var(--text);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  border-radius: 6px;
+  padding: 10px 12px;
+  line-height: 1.6;
+  outline-offset: 2px;
+}
+.review-options textarea {
+  min-height: 80px;
+  resize: vertical;
+  font-size: 12px;
+}
+.settings-form textarea {
+  min-height: 90px;
+  resize: vertical;
+}
+.settings-form .checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  color: var(--muted);
+}
+.advanced-settings {
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 14px;
+}
+.review-actions {
+  margin: 12px 0;
+}
+.review-actions > .secondary {
+  flex: 1;
+}
+.review-error {
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--amber);
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+}
+.review-success {
+  font-size: 12px;
+  color: var(--mint);
+  margin: 12px 0;
+}
+.review-result {
+  margin-top: 19px;
+}
+.review-state {
+  color: var(--mint);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.review-state.outdated {
+  color: var(--amber);
+}
+.review-state small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+.review-summary {
+  font-size: 12px;
+  line-height: 1.85;
+  margin: 10px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.review-coverage {
+  margin: 13px 0;
+  max-height: 240px;
+  overflow: auto;
+}
+.review-coverage p {
+  padding: 8px 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.review-coverage small {
+  display: block;
+  color: var(--muted);
+  margin-top: 3px;
+}
+.finding {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 12px;
+  background: #171c24;
+}
+.finding > summary {
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.priority {
+  margin-right: 6px;
+  font-size: 10px;
+  color: var(--amber);
+}
+.priority-P0,
+.priority-P1 {
+  color: var(--red);
+}
+.evidence-label {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 10px;
+}
+.finding-location {
+  justify-content: flex-start;
+  text-align: left;
+  color: var(--blue);
+  font-size: 11px;
+  padding: 8px 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.finding p {
+  margin: 6px 0;
+  font-size: 11px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.finding p b {
+  color: var(--muted);
+  font-weight: 500;
+  margin-right: 7px;
+}
+.finding pre {
+  margin: 9px 0;
+  padding: 9px;
+  background: var(--bg);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.7;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.text-button {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 6px 0;
+}
+.text-button:hover {
+  color: var(--mint);
+  background: transparent;
+}
+.review-destination {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 17px 0;
+  overflow-wrap: anywhere;
+}
+.review-destination span,
+.review-destination small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.review-advisory {
+  padding: 10px 12px;
+  margin: 12px 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: #b1bdcf;
+  font-size: 11px;
+  line-height: 1.8;
+}
+.model-dialog {
+  max-width: 560px;
+}
+.model-dialog h2 {
+  font-size: 17px;
+}
+.manual-copy textarea {
+  min-height: 180px;
+  font-size: 11px;
+}
+.diff-line.finding-highlight {
+  background: #4b4326;
+  outline: 1px solid var(--amber);
+  outline-offset: -1px;
+}
+.settings-form input:focus-visible {
+  outline: 2px solid var(--mint);
+}
