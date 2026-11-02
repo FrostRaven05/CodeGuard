@@ -1,6 +1,6 @@
 import { useMemo, useEffect, useRef } from 'react';
 import { AlertTriangle, FileDiff, LoaderCircle } from 'lucide-react';
-import type { DiffResult, Finding } from './types';
+import type { DiffResult, CodeLocation } from './types';
 
 function parseLines(text: string) {
   let oldLine = 0,
@@ -43,7 +43,7 @@ export function DiffView({
 }: {
   diff: DiffResult | null;
   loading: boolean;
-  focus?: Finding | null;
+  focus?: CodeLocation | null;
 }) {
   const lines = useMemo(() => parseLines(diff?.text || ''), [diff?.text]);
   const target = useRef<HTMLDivElement>(null);

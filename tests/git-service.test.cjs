@@ -39,6 +39,102 @@ async function fixture(t) {
   return { repo, owned, storage, service, id: repository.id, write, commitAll };
 }
 
+test('索引缓存与格式刷新不使草稿过期，暂存内容及分支变化仍使版本变化', async (t) => {
+  const f = await fixture(t);
+  f.write('nested/source.txt', 'baseline\n');
+  await f.commitAll('baseline');
+  f.write('nested/source.txt', 'staged\n');
+  await f.service.changeStaging(f.id, 'nested/source.txt', 'stage');
+  const before = (await f.service.getState(f.id)).indexRevision;
+  await f.service.captureStagedReview(f.id);
+  assert.equal((await f.service.getState(f.id)).indexRevision, before);
+  await runGit(f.repo, ['update-index', '--index-version', '4']);
+  assert.equal((await f.service.getState(f.id)).indexRevision, before);
+  f.write('nested/source.txt', 'unstaged\n');
+  assert.equal((await f.service.getState(f.id)).indexRevision, before);
+  await f.service.changeStaging(f.id, 'nested/source.txt', 'stage');
+  const stagedRevision = (await f.service.getState(f.id)).indexRevision;
+  assert.notEqual(stagedRevision, before);
+  await runGit(f.repo, ['switch', '-c', 'another-branch']);
+  assert.notEqual((await f.service.getState(f.id)).indexRevision, stagedRevision);
+});
+
+test('暂存全部覆盖修改、新增、删除与重命名，更新已暂存后再次编辑的版本并遵循忽略规则', async (t) => {
+  const f = await fixture(t);
+  f.write('source.txt', 'base\n');
+  f.write('deleted.txt', 'deleted\n');
+  f.write('old name.txt', 'rename content\n');
+  f.write('.gitignore', 'ignored/\nprivate.txt\n');
+  await f.commitAll('baseline');
+  f.write('source.txt', 'first staged\n');
+  await f.service.changeStaging(f.id, 'source.txt', 'stage');
+  f.write('source.txt', 'latest worktree\n');
+  fs.unlinkSync(path.join(f.repo, 'deleted.txt'));
+  fs.renameSync(path.join(f.repo, 'old name.txt'), path.join(f.repo, '中文 renamed.txt'));
+  f.write('-new file.txt', 'new\n');
+  f.write('ignored/private.txt', 'ignored content\n');
+  f.write('private.txt', 'ignored content\n');
+  f.service.saveDraft(f.id, 'keep draft');
+  const head = (await f.service.getState(f.id)).head;
+  const handlers = createHandlers(f.service, async () => null);
+  const result = await invoke(handlers, 'stageAll', [f.id]);
+  assert.equal(result.ok, true);
+  assert.equal(result.value.files.length, 4);
+  assert.ok(result.value.files.every((file) => !file.untracked && file.worktreeStatus === '.'));
+  assert.ok(
+    result.value.files.some((file) => file.indexStatus === 'D' && file.path === 'deleted.txt'),
+  );
+  assert.ok(result.value.files.some((file) => file.previousPath === 'old name.txt'));
+  assert.equal((await runGit(f.repo, ['show', ':source.txt'])).stdout, 'latest worktree\n');
+  assert.equal((await runGit(f.repo, ['diff', '--name-only'])).stdout, '');
+  assert.doesNotMatch((await runGit(f.repo, ['ls-files'])).stdout, /ignored|private/);
+  assert.equal(fs.readFileSync(path.join(f.repo, 'source.txt'), 'utf8'), 'latest worktree\n');
+  assert.equal(
+    fs.readFileSync(path.join(f.repo, 'ignored/private.txt'), 'utf8'),
+    'ignored content\n',
+  );
+  assert.equal(f.service.getWorkspace().drafts[f.id], 'keep draft');
+  assert.equal(result.value.head, head);
+  assert.equal((await invoke(handlers, 'stageAll', ['../outside'])).ok, false);
+});
+
+test('初始仓库可以暂存全部，无改动重复执行无副作用，索引锁保留并拒绝操作', async (t) => {
+  const f = await fixture(t);
+  assert.deepEqual((await f.service.stageAll(f.id)).files, []);
+  f.write('nested/新文件.txt', 'new\n');
+  const state = await f.service.stageAll(f.id);
+  assert.equal(state.files[0].indexStatus, 'A');
+  assert.equal(state.files[0].untracked, false);
+  assert.equal((await f.service.stageAll(f.id)).indexRevision, state.indexRevision);
+  f.write('nested/新文件.txt', 'keep unstaged\n');
+  const before = (await runGit(f.repo, ['ls-files', '--stage'])).stdout;
+  const lock = path.join(f.repo, '.git/index.lock');
+  fs.writeFileSync(lock, 'external lock');
+  await assert.rejects(f.service.stageAll(f.id), { code: 'INDEX_LOCKED' });
+  assert.equal(fs.readFileSync(lock, 'utf8'), 'external lock');
+  assert.equal((await runGit(f.repo, ['ls-files', '--stage'])).stdout, before);
+});
+
+test('暂存全部不会把未解决的冲突直接标成已解决', async (t) => {
+  const f = await fixture(t);
+  f.write('source.txt', 'base\n');
+  await f.commitAll('base');
+  await runGit(f.repo, ['branch', 'other']);
+  f.write('source.txt', 'main\n');
+  await f.commitAll('main change');
+  await runGit(f.repo, ['switch', 'other']);
+  f.write('source.txt', 'other\n');
+  await f.commitAll('other change');
+  await runGit(f.repo, ['switch', 'main']);
+  assert.notEqual((await runGit(f.repo, ['merge', 'other'], { allowFailure: true })).code, 0);
+  const before = (await runGit(f.repo, ['ls-files', '--unmerged'])).stdout;
+  const content = fs.readFileSync(path.join(f.repo, 'source.txt'), 'utf8');
+  await assert.rejects(f.service.stageAll(f.id), { code: 'CONFLICTS' });
+  assert.equal((await runGit(f.repo, ['ls-files', '--unmerged'])).stdout, before);
+  assert.equal(fs.readFileSync(path.join(f.repo, 'source.txt'), 'utf8'), content);
+  assert.ok(fs.existsSync(path.join(f.repo, '.git/MERGE_HEAD')));
+});
+
 test('仓库列表、当前选择与草稿可持久化，移除仅解除关联', async (t) => {
   const f = await fixture(t);
   f.service.saveDraft(f.id, '保留的提交草稿\n\n正文');

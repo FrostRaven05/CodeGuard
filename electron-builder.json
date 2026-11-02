@@ -1,0 +1,29 @@
+{
+  "appId": "local.codeguard.desktop",
+  "productName": "CodeGuard",
+  "directories": {
+    "output": "release"
+  },
+  "files": ["dist/**/*", "electron/**/*.cjs", "package.json"],
+  "asar": true,
+  "npmRebuild": false,
+  "win": {
+    "target": [
+      { "target": "nsis", "arch": ["x64"] },
+      { "target": "portable", "arch": ["x64"] }
+    ]
+  },
+  "nsis": {
+    "artifactName": "${productName}-${version}-Setup-${arch}.${ext}",
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "CodeGuard",
+    "deleteAppDataOnUninstall": false
+  },
+  "portable": {
+    "artifactName": "${productName}-${version}-Portable-${arch}.${ext}"
+  }
+}

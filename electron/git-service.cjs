@@ -2,6 +2,7 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { sensitive } = require('./review-safety.cjs');
 
 const DIFF_LIMIT = 700_000;
 const MAX_OUTPUT = 12 * 1024 * 1024;
@@ -15,7 +16,7 @@ class WorkbenchError extends Error {
   }
 }
 
-function runGit(cwd, args, { input, allowFailure = false, timeout = 60_000 } = {}) {
+function runGit(cwd, args, { input, allowFailure = false, timeout = 60_000, indexFile } = {}) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' };
     for (const name of [
@@ -27,6 +28,8 @@ function runGit(cwd, args, { input, allowFailure = false, timeout = 60_000 } = {
       'GIT_ALTERNATE_OBJECT_DIRECTORIES',
     ])
       delete env[name];
+    // Only internal snapshot code supplies an isolated index, never an IPC request.
+    if (indexFile) env.GIT_INDEX_FILE = indexFile;
     const child = spawn(
       'git',
       [
@@ -282,10 +285,43 @@ class GitService {
     return next;
   }
 
-  async getState(id) {
+  async getState(id, { disableFilters = false } = {}) {
     const repository = this.repository(id);
+    const filterOverrides = [];
+    if (disableFilters) {
+      const configured = (
+        await runGit(
+          repository.root,
+          [
+            'config',
+            '--name-only',
+            '--null',
+            '--get-regexp',
+            '^filter\..*\.(clean|process|required)$',
+          ],
+          { allowFailure: true },
+        )
+      ).stdout;
+      const names = new Set(
+        configured
+          .trim()
+          .split('\0')
+          .filter(Boolean)
+          .map((name) => name.replace(/\.(clean|process|required)$/, '')),
+      );
+      for (const name of names)
+        filterOverrides.push(
+          '-c',
+          `${name}.clean=`,
+          '-c',
+          `${name}.process=`,
+          '-c',
+          `${name}.required=false`,
+        );
+    }
     const raw = (
       await runGit(repository.root, [
+        ...filterOverrides,
         'status',
         '--porcelain=v2',
         '-z',
@@ -297,7 +333,7 @@ class GitService {
     const branchesRaw = (
       await runGit(repository.root, [
         'for-each-ref',
-        '--format=%(refname)%00%(refname:short)%00%(objectname)%00%(HEAD)',
+        '--format=%(refname)%00%(refname:short)%00%(objectname)%00%(HEAD)%00%(symref)',
         'refs/heads',
         'refs/remotes',
       ])
@@ -307,8 +343,10 @@ class GitService {
       .split('\n')
       .filter(Boolean)
       .map((line) => {
-        const [ref, name, sha, marker] = line.split('\0');
+        const [ref, name, sha, marker, symbolic] = line.split('\0');
         return {
+          ref,
+          symbolic: !!symbolic,
           name,
           hash: sha,
           current: marker === '*',
@@ -326,15 +364,10 @@ class GitService {
             : fs.existsSync(path.join(repository.gitDir, 'REVERT_HEAD'))
               ? 'revert'
               : null;
-    let indexBytes = Buffer.alloc(0);
-    try {
-      indexBytes = fs.readFileSync(path.join(repository.gitDir, 'index'));
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-    const indexRevision = hash(
-      Buffer.concat([Buffer.from(`${state.head}:${state.branch}:`), indexBytes]),
-    );
+    // Cache-tree/stat refreshes rewrite index bytes without changing staged content.
+    // Include modes, object IDs, merge stages and paths, but no cache metadata.
+    const indexEntries = (await runGit(repository.root, ['ls-files', '--stage', '-z'])).stdout;
+    const indexRevision = hash(`${state.head}:${state.branch}:${indexEntries}`);
     const stats = state.files.map((file) => {
       try {
         const stat = fs.lstatSync(this.absolutePath(repository, file.path));
@@ -350,6 +383,7 @@ class GitService {
       operation,
       locked: fs.existsSync(path.join(repository.gitDir, 'index.lock')),
       indexRevision,
+      worktreeRevision: hash(`${indexRevision}:${JSON.stringify(state.files)}:${stats.join('|')}`),
       revision: hash(`${raw}:${indexRevision}:${stats.join('|')}`),
     };
   }
@@ -383,6 +417,19 @@ class GitService {
           await runGit(repository.root, ['restore', '--staged', '--source=HEAD', '--', ...paths]);
         else await runGit(repository.root, ['update-index', '--force-remove', '--', ...paths]);
       } else throw new WorkbenchError('不支持的暂存操作。', 'INVALID_ACTION');
+      return this.getState(id);
+    });
+  }
+
+  async stageAll(id) {
+    return this.serialize(id, async () => {
+      const repository = this.repository(id);
+      const state = await this.getState(id);
+      if (state.locked)
+        throw new WorkbenchError('Git 索引正在被占用，请稍后刷新。', 'INDEX_LOCKED');
+      if (state.files.some((file) => file.conflict))
+        throw new WorkbenchError('存在未解决的冲突，请先逐个核对和暂存冲突文件。', 'CONFLICTS');
+      await runGit(repository.root, ['add', '--all']);
       return this.getState(id);
     });
   }
@@ -502,6 +549,16 @@ class GitService {
     return { tree, head, ref };
   }
 
+  async captureLocalReview(id, configuration) {
+    return this.serialize(id, () =>
+      require('./local-review.cjs').captureLocalReview(this, id, configuration),
+    );
+  }
+
+  async localReviewSignature(id, configuration) {
+    return require('./local-review.cjs').localReviewSignature(this, id, configuration);
+  }
+
   async captureStagedReview(id) {
     return this.serialize(id, async () => {
       const repository = this.repository(id);
@@ -565,12 +622,7 @@ class GitService {
       const content = (await runGit(repository.root, ['show', `${revision}:${relativePath}`]))
         .stdout;
       if (content.includes('\0')) return { reason: '二进制文件' };
-      if (
-        /-----BEGIN [\w ]*PRIVATE KEY-----|(?:api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*["'][^"'\s]{12,}["']|\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,})/i.test(
-          content,
-        )
-      )
-        return { reason: '检测到疑似密钥内容' };
+      if (sensitive(content)) return { reason: '检测到疑似密钥内容' };
     }
     const text = (
       await runGit(repository.root, [
@@ -589,6 +641,34 @@ class GitService {
     ).stdout;
     if (text.length > limit) return { reason: '差异超过上下文预算' };
     if (/^Binary files |^GIT binary patch/m.test(text)) return { reason: '二进制文件' };
+    return { text };
+  }
+
+  async reviewTreePaths(snapshot, side) {
+    const revision = side === 'old' ? snapshot.head : snapshot.tree;
+    if (!revision) return [];
+    const repository = this.repository(snapshot.repositoryId);
+    const result = await runGit(repository.root, ['ls-tree', '-r', '-z', '--name-only', revision]);
+    return result.stdout.split('\0').filter(Boolean);
+  }
+
+  async readReviewBlob(snapshot, relative, side, limit = 50000) {
+    const repository = this.repository(snapshot.repositoryId);
+    this.absolutePath(repository, relative);
+    const revision = side === 'old' ? snapshot.head : snapshot.tree;
+    if (!revision) return { reason: '父版本不存在' };
+    const entry = (await runGit(repository.root, ['ls-tree', '-z', revision, '--', relative]))
+      .stdout;
+    if (!entry) return { reason: '该快照无此文件' };
+    if (!['100644', '100755'].includes(entry.split(' ')[0]))
+      return { reason: '符号链接、子模块或非普通文件' };
+    const size = Number(
+      (await runGit(repository.root, ['cat-file', '-s', `${revision}:${relative}`])).stdout.trim(),
+    );
+    if (size > limit) return { reason: '文件超过上下文读取上限' };
+    const text = (await runGit(repository.root, ['show', `${revision}:${relative}`])).stdout;
+    if (text.includes('\0')) return { reason: '二进制文件' };
+    if (sensitive(text)) return { reason: '检测到疑似密钥内容' };
     return { text };
   }
 
@@ -692,6 +772,74 @@ class GitService {
             : '实际提交内容与预览不同，可能由 Git 钩子或外部操作修改。请核对提交历史。',
       };
     });
+  }
+
+  async getHistoryPage(id, options = {}) {
+    const repository = this.repository(id);
+    if (!options || typeof options !== 'object' || Array.isArray(options))
+      throw new WorkbenchError('历史查询无效。', 'INVALID_REQUEST');
+    const { ref = '', query = '', skip = 0 } = options;
+    if (
+      typeof ref !== 'string' ||
+      typeof query !== 'string' ||
+      query.length > 200 ||
+      /[\x00-\x1f]/.test(query) ||
+      !Number.isSafeInteger(skip) ||
+      skip < 0 ||
+      skip > 10_000_000
+    )
+      throw new WorkbenchError('历史查询无效。', 'INVALID_REQUEST');
+    const refs = (
+      await runGit(repository.root, [
+        'for-each-ref',
+        '--format=%(refname)',
+        'refs/heads',
+        'refs/remotes',
+        'refs/tags',
+      ])
+    ).stdout
+      .trim()
+      .split('\n');
+    if (ref && !refs.includes(ref))
+      throw new WorkbenchError('浏览分支已不存在，请返回全部历史。', 'INVALID_REF');
+    const head = await runGit(repository.root, ['rev-parse', '--verify', 'HEAD'], {
+      allowFailure: true,
+    });
+    if (!ref && !refs.some(Boolean) && head.code !== 0)
+      return { commits: [], hasMore: false, nextSkip: 0 };
+    const needle = query.trim().toLocaleLowerCase();
+    const commits = [];
+    let offset = skip;
+    const batch = needle ? 500 : 151;
+    // Scan beyond the loaded page: searches also find old commits and authors/hashes.
+    for (;;) {
+      const raw = (
+        await runGit(repository.root, [
+          'log',
+          '--topo-order',
+          `--skip=${offset}`,
+          `--max-count=${batch}`,
+          '--format=%H%x00%P%x00%D%x00%an%x00%aI%x00%s%x00',
+          ...(ref ? [ref] : ['--all', ...(head.code === 0 ? ['HEAD'] : [])]),
+          '--',
+        ])
+      ).stdout;
+      const rows = parseHistory(raw);
+      for (let i = 0; i < rows.length; i++) {
+        const item = rows[i];
+        if (
+          !needle ||
+          [item.subject, item.author, item.hash].some((value) =>
+            value.toLocaleLowerCase().includes(needle),
+          )
+        ) {
+          if (commits.length === 150) return { commits, hasMore: true, nextSkip: offset + i };
+          commits.push(item);
+        }
+      }
+      offset += rows.length;
+      if (rows.length < batch) return { commits, hasMore: false, nextSkip: offset };
+    }
   }
 
   async getHistory(id) {

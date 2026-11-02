@@ -1,61 +1,75 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Copy, LoaderCircle, Settings2, Sparkles } from 'lucide-react';
+import { ArrowRight, LoaderCircle, Sparkles } from 'lucide-react';
 import { api } from './api';
 import { Modal } from './Modal';
+import { useFindingRevision, findingDisposition, flushFindingDrafts } from './findingDrafts';
+import {
+  useReviewDraft,
+  initializeReviewDraft,
+  saveReviewDraft,
+  flushReviewDraft,
+} from './reviewDrafts';
 import type {
-  Finding,
   ModelSettings,
   RepositoryState,
-  ReviewOptions,
+  ReviewScope,
   ReviewPreview,
   ReviewState,
+  ReviewProgress,
 } from './types';
 
-const emptyOptions = { standards: '', requirements: '' };
 export function ReviewPanel({
   repository,
   settingsVersion,
   onSettings,
   onState,
-  onLocate,
+  onOpen,
+  workspaceOpen,
+  scope,
+  onScope,
 }: {
   repository: RepositoryState;
   settingsVersion: number;
   onSettings: () => void;
   onState: (value: ReviewState) => void;
-  onLocate: (finding: Finding) => void;
+  onOpen: () => void;
+  workspaceOpen: boolean;
+  scope: ReviewScope;
+  onScope: (scope: ReviewScope) => void;
 }) {
+  useFindingRevision();
   const id = repository.repositoryId;
   const [review, setReview] = useState<ReviewState | null>(null);
-  const [options, setOptions] = useState<ReviewOptions>(emptyOptions);
+  const draft = useReviewDraft(id);
+  const options = draft.options;
+  const setOptions = (value: typeof options) => saveReviewDraft(id, value);
   const [settings, setSettings] = useState<ModelSettings | null>(null);
   const [preview, setPreview] = useState<ReviewPreview | null>(null);
   const [preparing, setPreparing] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
-  const [copied, setCopied] = useState('');
-  const [manualCopy, setManualCopy] = useState('');
   const alive = useRef(true),
-    initialized = useRef(false),
     request = useRef(0);
+  const currentScope = useRef(scope);
+  currentScope.current = scope;
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
   const update = useCallback(async () => {
     const generation = ++request.current;
     try {
-      const value = await api.reviewState(id);
-      if (!alive.current || generation !== request.current) return;
+      const value = await api.reviewState(id, scope);
+      if (!alive.current || generation !== request.current || currentScope.current !== scope)
+        return;
       setReview(value);
-      if (!initialized.current) {
-        initialized.current = true;
-        setOptions(value.options);
-      }
+      initializeReviewDraft(id, value.options);
     } catch (reason) {
       if (alive.current) setError(reason instanceof Error ? reason.message : '无法读取评审。');
     }
-  }, [id]);
+  }, [id, scope]);
   useEffect(() => {
     alive.current = true;
+    setReview(null);
+    setPreview(null);
     void update();
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') void update();
@@ -68,7 +82,52 @@ export function ReviewPanel({
   }, [update]);
   useEffect(() => {
     void update();
-  }, [repository.indexRevision, settingsVersion, update]);
+  }, [repository.revision, settingsVersion, update]);
+  const acceptProgress = useCallback(
+    (progress: ReviewProgress) => {
+      if (!alive.current || progress.repositoryId !== id || progress.scope !== scope) return;
+      setReview((previous) => {
+        if (!previous || (previous.progress && previous.progress.startedAt > progress.startedAt))
+          return previous;
+        return {
+          ...previous,
+          progress,
+          running: progress.status === 'running',
+          runningScope: progress.status === 'running' ? progress.scope : null,
+        };
+      });
+    },
+    [id, scope],
+  );
+  useEffect(() => api.onReviewProgress(acceptProgress), [acceptProgress]);
+  useEffect(() => {
+    // The disposable browser preview has no Electron event channel. Poll only the
+    // in-memory progress snapshot, without repeating Git fingerprint work.
+    if (api.mode === 'desktop' || !(pending || review?.running)) return;
+    let disposed = false,
+      reading = false;
+    const poll = async () => {
+      if (reading) return;
+      reading = true;
+      try {
+        const progress = await api.reviewProgress(id, scope);
+        if (!disposed && progress) acceptProgress(progress);
+      } catch {
+        /* The regular state refresh reports connection failures. */
+      } finally {
+        reading = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 250);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [id, scope, pending, review?.running, acceptProgress]);
+  useEffect(() => {
+    if (draft.initialized && !draft.saving && !draft.error) void update();
+  }, [draft.saving, draft.initialized, draft.error, update]);
   useEffect(() => {
     let mounted = true;
     api
@@ -80,7 +139,8 @@ export function ReviewPanel({
       mounted = false;
     };
   }, [settingsVersion]);
-  async function prepare() {
+  async function prepare(target: ReviewScope = scope) {
+    onScope(target);
     if (!settings?.baseUrl) {
       onSettings();
       return;
@@ -88,8 +148,9 @@ export function ReviewPanel({
     setPreparing(true);
     setError('');
     try {
-      await api.saveReviewOptions(id, options);
-      const value = await api.prepareReview(id);
+      await flushReviewDraft(id);
+      await flushFindingDrafts(id, target);
+      const value = await api.prepareReview(id, target);
       if (alive.current) setPreview(value);
       await update();
     } catch (reason) {
@@ -103,9 +164,9 @@ export function ReviewPanel({
     const token = preview.token;
     setPreview(null);
     setPending(true);
+    setReview((previous) => (previous ? { ...previous, progress: null } : previous));
     setError('');
-    setCopied('');
-    setManualCopy('');
+    onOpen();
     try {
       await api.startReview(id, token);
     } catch (reason) {
@@ -125,17 +186,7 @@ export function ReviewPanel({
       if (alive.current) setError(reason instanceof Error ? reason.message : '取消失败。');
     }
   }
-  async function copy(finding: Finding) {
-    const text = `本次提交评审 · ${finding.evidenceStatus}\n快照 ${review?.latest?.tree}\n${finding.priority} ${finding.title}\n位置：${finding.path}:${finding.line}（${finding.side === 'new' ? '暂存版本' : '父版本'}）\n触发：${finding.trigger}\n后果：${finding.consequence}\n证据：\n${finding.evidence}\n修复方向：${finding.suggestion}\n验证：未运行；请先核对当前源码再修复。`;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(finding.id);
-      setManualCopy('');
-    } catch {
-      setManualCopy(text);
-    }
-  }
-  const latest = review?.latest;
+  const latest = review?.scope === scope ? review.latest : null;
   const running = pending || review?.running;
   const dirty = Boolean(
     review &&
@@ -144,75 +195,70 @@ export function ReviewPanel({
   );
   const stale = Boolean(latest?.stale || dirty);
   useEffect(() => {
-    if (review)
+    if (review && review.scope === scope)
       onStateRef.current({
         ...review,
         running: Boolean(pending || review.running),
         latest: latest ? { ...latest, stale } : null,
       });
-  }, [review, latest, stale, pending]);
+  }, [review, latest, stale, pending, scope]);
   const staged = repository.files.filter(
     (file) => file.indexStatus !== '.' && !file.conflict,
   ).length;
   return (
-    <section className="review-panel" aria-label="本次提交评审">
-      <div className="review-heading">
-        <h2>
-          <Sparkles size={15} />
-          AI 评审
-        </h2>
+    <section className="review-panel" aria-label="改动理解与评审">
+      <div className="review-scope-switch" role="group" aria-label="分析范围">
         <button
-          className="icon-button"
-          title="模型服务设置"
-          aria-label="模型服务设置"
-          onClick={onSettings}
+          className={scope === 'local' ? 'active' : ''}
+          aria-pressed={scope === 'local'}
+          disabled={!!running || preparing || !draft.initialized}
+          onClick={() => onScope('local')}
         >
-          <Settings2 size={14} />
+          全部本地改动
+        </button>
+        <button
+          className={scope === 'staged' ? 'active' : ''}
+          aria-pressed={scope === 'staged'}
+          disabled={!!running || preparing || !draft.initialized}
+          onClick={() => onScope('staged')}
+        >
+          本次提交
         </button>
       </div>
       <p className="field-help">
-        本次提交 · 只评审暂存内容
-        <br />
-        结果仅供参考，随时可以继续提交。
+        {scope === 'local'
+          ? '理解当前工作区和未跟踪文件，不会暂存。'
+          : '仅评审已暂存内容，与未暂存编辑分开。'}
       </p>
-      <details className="review-options">
-        <summary>
-          规范与需求 <span>可选</span>
-        </summary>
-        <label>
-          评审规范
-          <textarea
-            value={options.standards}
-            maxLength={16000}
-            disabled={!!running || preparing}
-            placeholder="例如：公共接口保持兼容；优先检查错误处理。"
-            onChange={(event) => setOptions({ ...options, standards: event.target.value })}
-          />
-        </label>
-        <label>
-          本次需求
-          <textarea
-            value={options.requirements}
-            maxLength={16000}
-            disabled={!!running || preparing}
-            placeholder="粘贴本次需求；留空将跳过需求核对。"
-            onChange={(event) => setOptions({ ...options, requirements: event.target.value })}
-          />
-        </label>
-        <p className="field-help">点击评审时保存到本地；本批次暂不自动发现项目文档。</p>
-      </details>
       <div className="review-actions">
         <button
+          className="secondary understand-local-button"
+          disabled={preparing || !!running || !repository.files.length || !draft.initialized}
+          onClick={() => void prepare('local')}
+        >
+          <Sparkles size={16} />
+          {scope === 'local' && preparing
+            ? '准备范围…'
+            : scope === 'local' && running
+              ? '正在理解改动…'
+              : '理解全部本地改动'}
+        </button>
+        <button
           className="secondary"
-          disabled={preparing || !!running || !staged || !review}
-          onClick={() => void prepare()}
+          title="仅评审已暂存的内容"
+          disabled={preparing || !!running || !staged || !draft.initialized}
+          onClick={() => void prepare('staged')}
         >
           {preparing || running ? (
-            <LoaderCircle size={14} className="spin" />
+            <LoaderCircle size={16} className="spin" />
           ) : (
-            <Sparkles size={14} />
+            <Sparkles size={16} />
           )}
-          {preparing ? '准备范围…' : running ? '正在评审…' : '评审本次提交'}
+          {scope === 'staged' && preparing
+            ? '准备范围…'
+            : scope === 'staged' && running
+              ? '正在评审…'
+              : '评审本次提交'}
         </button>
         {running && (
           <button className="text-button" onClick={() => void cancel()}>
@@ -220,121 +266,116 @@ export function ReviewPanel({
           </button>
         )}
       </div>
-      {!settings?.baseUrl && <p className="field-help">首次使用请配置模型服务。</p>}
+      {!staged ? (
+        <p className="field-help review-hint">可先理解全部改动；评审本次提交需要暂存文件</p>
+      ) : (
+        !settings?.baseUrl && (
+          <button className="text-button" onClick={onSettings}>
+            配置模型服务
+          </button>
+        )
+      )}
       {(error || review?.error) && (
         <p className="review-error" role="alert">
           {error || review?.error}
         </p>
       )}
-      {latest && (
-        <div className="review-result">
-          <div className={`review-state ${stale ? 'outdated' : ''}`}>
-            {stale
-              ? '基于旧版本 · 建议重新评审'
-              : latest.skipped.length || latest.unverifiedCount
-                ? '评审完成 · 部分覆盖'
-                : '评审完成'}
-            <small>
-              {latest.model} ·{' '}
-              {new Date(latest.createdAt).toLocaleTimeString('zh-CN', {
-                hour: '2-digit',
-                minute: '2-digit',
-              })}
-            </small>
-          </div>
-          <p className="review-summary">{latest.summary}</p>
-          <p className="field-help">
-            {latest.hasRequirements ? '已按所填需求核对' : '未核对需求'} · 检查未运行
-            <br />
-            覆盖 {latest.included.length} 个文件 · 用量{' '}
-            {latest.totalTokens === null ? '未知' : `${latest.totalTokens} tokens`} · 费用未知
-          </p>
-          {latest.unverifiedCount > 0 && (
-            <p className="review-error">
-              {latest.unverifiedCount} 条候选问题的格式、位置或摘录未通过核对，未列为有效发现。
-            </p>
-          )}
-          {latest.skipped.length > 0 && (
-            <details className="review-coverage">
-              <summary>{latest.skipped.length} 个文件未评审</summary>
-              {latest.skipped.map((item) => (
-                <p key={item.path}>
-                  {item.path}
-                  <small>{item.reason}</small>
-                </p>
-              ))}
-            </details>
-          )}
-          {!latest.findings.length && (
-            <p className="field-help">
-              {latest.unverifiedCount
-                ? '没有可定位的问题；候选问题仍需人工核对。'
-                : latest.skipped.length
-                  ? '已覆盖范围未发现问题；排除部分未评审。'
-                  : '本范围未发现问题。'}
-            </p>
-          )}
-          {latest.findings.map((finding, index) => (
-            <details key={finding.id} className="finding" open={index === 0}>
-              <summary>
-                <span className={`priority priority-${finding.priority}`}>{finding.priority}</span>
-                {finding.title}
-              </summary>
-              <span className="evidence-label">
-                {finding.evidenceStatus} ·{' '}
-                {
-                  { correctness: '正确性', standards: '规范', requirements: '需求' }[
-                    finding.category
-                  ]
-                }
-              </span>
-              <button
-                className="finding-location"
-                disabled={stale}
-                title={stale ? '旧版本位置，请先重新评审' : '查看暂存差异中的对应行'}
-                onClick={() => onLocate(finding)}
-              >
-                {finding.path}:{finding.line} · {finding.side === 'new' ? '暂存版本' : '父版本'}
-              </button>
-              <p>
-                <b>触发</b>
-                {finding.trigger}
-              </p>
-              <p>
-                <b>影响</b>
-                {finding.consequence}
-              </p>
-              <pre>{finding.evidence}</pre>
-              <p>
-                <b>建议</b>
-                {finding.suggestion}
-              </p>
-              <button className="text-button" disabled={stale} onClick={() => void copy(finding)}>
-                <Copy size={12} />
-                {copied === finding.id ? '已复制' : '复制给编码助手'}
-              </button>
-            </details>
-          ))}
-          {manualCopy && (
-            <label className="manual-copy">
-              复制不可用，请选择以下内容手动复制
-              <textarea readOnly value={manualCopy} onFocus={(event) => event.target.select()} />
-            </label>
+      {running && !workspaceOpen && (
+        <div className="review-live-status" role="status">
+          <LoaderCircle size={14} className="spin" />
+          <span>{review?.progress?.events.at(-1)?.label || '正在启动评审…'}</span>
+          {!workspaceOpen && (
+            <button className="text-button" onClick={onOpen}>
+              查看过程
+            </button>
           )}
         </div>
       )}
-      {!latest && !running && <p className="field-help">尚未评审 · 检查未运行</p>}
+      {latest && (
+        <div className="review-result">
+          <p className={`review-state ${stale ? 'outdated' : ''}`}>
+            {running
+              ? '重新评审中 · 保留上次结果'
+              : stale
+                ? '结果已过期'
+                : latest.skipped.length || latest.unverifiedCount || latest.contextSkipped?.length
+                  ? '评审完成 · 部分覆盖'
+                  : '评审完成'}
+            <span>
+              {' '}
+              ·{' '}
+              {
+                latest.findings.filter(
+                  (f) =>
+                    (findingDisposition(id, latest.id, scope, f.id)?.status ||
+                      f.disposition?.status ||
+                      'pending') === 'pending',
+                ).length
+              }{' '}
+              项待处理
+            </span>
+          </p>
+          {!workspaceOpen && (
+            <button className="secondary review-open-workspace" onClick={onOpen}>
+              查看审查结果
+              <ArrowRight size={16} />
+            </button>
+          )}
+        </div>
+      )}
+      <details className="review-options">
+        <summary>规范与需求</summary>
+        <p className={draft.error ? 'review-error' : 'field-help'} role="status">
+          {draft.error
+            ? `保存失败：${draft.error}`
+            : draft.saving
+              ? '保存中…'
+              : draft.initialized
+                ? '已自动保存'
+                : '读取草稿…'}
+          {draft.error && (
+            <button className="text-button" onClick={() => saveReviewDraft(id, options)}>
+              重试保存
+            </button>
+          )}
+        </p>
+        <div className="review-options-fields">
+          <label>
+            评审规范
+            <textarea
+              value={options.standards}
+              maxLength={16000}
+              disabled={!!running || preparing || !draft.initialized}
+              placeholder="例如：公共接口保持兼容；检查错误处理。"
+              onChange={(event) => setOptions({ ...options, standards: event.target.value })}
+            />
+          </label>
+          <label>
+            本次需求
+            <textarea
+              value={options.requirements}
+              maxLength={16000}
+              disabled={!!running || preparing || !draft.initialized}
+              placeholder="留空则跳过需求核对"
+              onChange={(event) => setOptions({ ...options, requirements: event.target.value })}
+            />
+          </label>
+        </div>
+      </details>
       {preview && (
-        <Modal title="发送本次提交评审" onClose={() => setPreview(null)}>
+        <Modal
+          title={preview.scope === 'local' ? '发送全部本地改动分析' : '发送本次提交评审'}
+          onClose={() => setPreview(null)}
+        >
           <p className="dialog-subtitle">
-            仅将以下固定暂存差异与所填规范、需求发送给你的模型服务。
+            将以下固定差异、相关代码片段与所填规范、需求发送给你的模型服务。
           </p>
           <div className="review-destination">
             <strong>{preview.model}</strong>
             <span>{preview.baseUrl}</span>
             <small>
-              {preview.branch} · 暂存树 {preview.tree.slice(0, 8)} · 约{' '}
-              {preview.chars.toLocaleString()} 字符
+              {preview.branch} · {preview.scope === 'local' ? '工作区快照' : '暂存树'}{' '}
+              {preview.tree.slice(0, 8)} · 约 {preview.chars.toLocaleString()} 字符
             </small>
           </div>
           <div className="preview-file-list">
@@ -345,6 +386,29 @@ export function ReviewPanel({
               </div>
             ))}
           </div>
+          <details className="review-coverage" open>
+            <summary>相关上下文 {preview.contexts.length} 段</summary>
+            {preview.contexts.map((item, index) => (
+              <p key={index}>
+                {item.path}:{item.startLine}–{item.endLine}
+                <small>
+                  {item.side === 'new'
+                    ? preview.scope === 'local'
+                      ? '工作区快照'
+                      : '暂存树'
+                    : '父版本'}{' '}
+                  {item.revision.slice(0, 8)} · {item.kind} · {item.chars} 字符
+                </small>
+              </p>
+            ))}
+            <p className="field-help">{preview.contextLimitation}</p>
+            {preview.contextSkipped.map((item, index) => (
+              <p key={index}>
+                {item.path}
+                <small>{item.reason}</small>
+              </p>
+            ))}
+          </details>
           {preview.skipped.length > 0 && (
             <details className="review-coverage" open>
               <summary>{preview.skipped.length} 个文件不会发送</summary>

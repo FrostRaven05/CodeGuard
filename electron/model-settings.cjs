@@ -172,7 +172,7 @@ class ModelSettings {
 async function callModel(
   connection,
   messages,
-  { signal, timeoutMs = 90000, fetchImpl = fetch } = {},
+  { signal, timeoutMs = 90000, fetchImpl = fetch, stream = false, onContent } = {},
 ) {
   const timeout = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -185,7 +185,12 @@ async function callModel(
         'Content-Type': 'application/json',
         ...(connection.apiKey ? { Authorization: `Bearer ${connection.apiKey}` } : {}),
       },
-      body: JSON.stringify({ model: connection.model, messages, stream: false }),
+      body: JSON.stringify({
+        model: connection.model,
+        messages,
+        stream,
+        ...(stream ? { stream_options: { include_usage: true } } : {}),
+      }),
     });
     if (!response.ok) {
       await response.body?.cancel();
@@ -197,23 +202,33 @@ async function callModel(
       throw new WorkbenchError(message, 'MODEL_HTTP_ERROR');
     }
     const reader = response.body.getReader();
-    const chunks = [];
-    let size = 0;
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > 2000000) {
-        await reader.cancel();
-        throw new WorkbenchError('模型响应过大，请缩小评审范围。', 'MODEL_OUTPUT_LIMIT');
-      }
-      chunks.push(Buffer.from(value));
-    }
+    const redact = (text) =>
+      connection.apiKey ? text.replaceAll(connection.apiKey, '[密钥已隐藏]') : text;
     let result;
-    try {
-      result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    } catch {
-      throw new WorkbenchError('模型服务未返回有效 JSON 响应。', 'MODEL_INVALID_RESPONSE');
+    if (
+      stream &&
+      response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
+    ) {
+      const { readCompletionStream } = require('./model-stream.cjs');
+      result = await readCompletionStream(reader, (content) => onContent?.(redact(content)));
+    } else {
+      const chunks = [];
+      let size = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > 2000000) {
+          await reader.cancel();
+          throw new WorkbenchError('模型响应过大，请缩小评审范围。', 'MODEL_OUTPUT_LIMIT');
+        }
+        chunks.push(Buffer.from(value));
+      }
+      try {
+        result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        throw new WorkbenchError('模型服务未返回有效 JSON 响应。', 'MODEL_INVALID_RESPONSE');
+      }
     }
     const choice = result.choices?.[0];
     if (choice?.finish_reason && !['stop', 'end_turn'].includes(choice.finish_reason))
@@ -226,12 +241,17 @@ async function callModel(
         '模型服务未返回文本，请检查接口协议与模型名称。',
         'MODEL_INVALID_RESPONSE',
       );
-    const redact = (text) =>
-      connection.apiKey ? text.replaceAll(connection.apiKey, '[密钥已隐藏]') : text;
+    if (stream) onContent?.(redact(choice.message.content));
     const tokens = result.usage?.total_tokens;
+    const count = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
     return {
       content: redact(choice.message.content),
       totalTokens: Number.isSafeInteger(tokens) && tokens >= 0 ? tokens : null,
+      usage: {
+        promptTokens: count(result.usage?.prompt_tokens),
+        completionTokens: count(result.usage?.completion_tokens),
+        totalTokens: count(tokens),
+      },
     };
   } catch (error) {
     if (signal?.aborted)

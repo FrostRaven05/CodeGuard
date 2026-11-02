@@ -1,6 +1,7 @@
 {
   "name": "codeguard",
-  "version": "0.1.0",
+  "productName": "CodeGuard",
+  "version": "0.1.1",
   "private": true,
   "description": "A local Git workbench for understanding and submitting changes.",
   "main": "electron/main.cjs",
@@ -8,8 +9,11 @@
     "dev": "node scripts/dev.mjs",
     "start": "node scripts/start.mjs",
     "build": "tsc --noEmit && vite build",
+    "package": "npm run build && electron-builder --win --x64 --publish never",
+    "package:dir": "npm run build && electron-builder --win --x64 --dir --publish never",
     "check": "tsc --noEmit",
     "test": "node --test tests/*.test.cjs",
+    "test:ux": "node --test tests/review-drafts.test.cjs tests/ux-review.test.cjs",
     "test:desktop": "node scripts/desktop-smoke.mjs",
     "format": "prettier --write src electron scripts tests vite.config.mjs index.html package.json",
     "preview:fixture": "node scripts/preview.mjs"
@@ -27,6 +31,7 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "electron": "44.7.2",
+    "electron-builder": "26.18.1",
     "prettier": "3.9.10",
     "typescript": "7.0.2",
     "vite": "8.3.4"

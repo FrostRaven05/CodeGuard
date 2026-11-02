@@ -2,7 +2,22 @@ import { useEffect, useState } from 'react';
 import { LoaderCircle } from 'lucide-react';
 import { api } from './api';
 import { Modal } from './Modal';
+import { SettingsSelect } from './SettingsSelect';
 import type { ModelSettings } from './types';
+
+const deepseekUrl = 'https://api.deepseek.com';
+// Verified against the official model list on 2026-10-18. Other IDs remain editable.
+const models = [
+  { value: 'deepseek-flash', label: 'DeepSeek Flash' },
+  { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
+  { value: 'custom', label: '自定义模型' },
+];
+function isDeepseek(baseUrl: string) {
+  return /^https:\/\/api\.deepseek\.com(?:\/v1)?(?:\/chat\/completions)?\/?$/i.test(baseUrl);
+}
+function modelChoice(model: string) {
+  return models.some((item) => item.value !== 'custom' && item.value === model) ? model : 'custom';
+}
 
 export function ModelSettingsDialog({
   onClose,
@@ -17,13 +32,25 @@ export function ModelSettingsDialog({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [service, setService] = useState('deepseek');
+  const [choice, setChoice] = useState('deepseek-flash');
+  const [custom, setCustom] = useState({ baseUrl: '', model: '' });
+  const [customModel, setCustomModel] = useState('');
+  const [deepseekModel, setDeepseekModel] = useState('deepseek-flash');
   useEffect(() => {
     let alive = true;
     api
       .modelSettings()
       .then((value) => {
         if (alive) {
-          setSettings(value);
+          const preset = !value.baseUrl || isDeepseek(value.baseUrl);
+          const model = value.model || 'deepseek-flash';
+          setService(preset ? 'deepseek' : 'custom');
+          setChoice(modelChoice(model));
+          setCustom({ baseUrl: value.baseUrl, model: value.model });
+          setDeepseekModel(preset ? model : 'deepseek-flash');
+          setCustomModel(preset && modelChoice(model) === 'custom' ? model : '');
+          setSettings(value.baseUrl ? value : { ...value, baseUrl: deepseekUrl, model });
           if (value.warning) setError(value.warning);
         }
       })
@@ -64,28 +91,69 @@ export function ModelSettingsDialog({
           }}
           className="settings-form"
         >
-          <label>
-            服务地址
-            <input
-              type="url"
-              required
-              value={settings.baseUrl}
-              placeholder="https://your-service.example/v1"
+          <SettingsSelect
+            label="模型服务"
+            value={service}
+            options={[
+              { value: 'deepseek', label: 'DeepSeek 官方' },
+              { value: 'custom', label: '自定义服务' },
+            ]}
+            disabled={busy}
+            onChange={(next) => {
+              if (next === service) return;
+              setService(next);
+              setMessage('');
+              if (next === 'custom') {
+                setDeepseekModel(settings.model);
+                setSettings({ ...settings, ...custom });
+              } else {
+                setCustom({ baseUrl: settings.baseUrl, model: settings.model });
+                setChoice(modelChoice(deepseekModel));
+                setSettings({ ...settings, baseUrl: deepseekUrl, model: deepseekModel });
+              }
+            }}
+          />
+          {service === 'custom' && (
+            <label>
+              服务地址
+              <input
+                type="url"
+                required
+                value={settings.baseUrl}
+                placeholder="https://your-service.example/v1"
+                disabled={busy}
+                onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })}
+              />
+            </label>
+          )}
+          {service === 'deepseek' && (
+            <SettingsSelect
+              label="模型"
+              value={choice}
+              options={models}
               disabled={busy}
-              onChange={(event) => setSettings({ ...settings, baseUrl: event.target.value })}
+              onChange={(next) => {
+                if (next === choice) return;
+                if (choice === 'custom') setCustomModel(settings.model);
+                setChoice(next);
+                setMessage('');
+                setSettings({ ...settings, model: next === 'custom' ? customModel : next });
+              }}
             />
-          </label>
-          <label>
-            模型名称
-            <input
-              required
-              value={settings.model}
-              placeholder="服务提供的模型 ID"
-              maxLength={200}
-              disabled={busy}
-              onChange={(event) => setSettings({ ...settings, model: event.target.value })}
-            />
-          </label>
+          )}
+          {(service === 'custom' || choice === 'custom') && (
+            <label>
+              模型名称
+              <input
+                required
+                value={settings.model}
+                placeholder="服务提供的模型 ID"
+                maxLength={200}
+                disabled={busy}
+                onChange={(event) => setSettings({ ...settings, model: event.target.value })}
+              />
+            </label>
+          )}
           <label>
             API 密钥
             <input

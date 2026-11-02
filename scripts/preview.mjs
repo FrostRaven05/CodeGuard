@@ -79,7 +79,7 @@ const reviews = new ReviewService(
 let mockModel;
 if (process.argv.includes('--mock-model')) {
   const { startMockModel } = require('../tests/fixtures/mock-model.cjs');
-  mockModel = await startMockModel();
+  mockModel = await startMockModel({ reviewChunkDelayMs: 120 });
   reviews.settings.save({
     baseUrl: mockModel.baseUrl,
     model: '模拟服务 · 仅交互验收',
@@ -144,6 +144,7 @@ async function close() {
   if (closing) return;
   closing = true;
   for (const controller of reviews.running.values()) controller.abort();
+  for (const controller of reviews.commitMessages.running.values()) controller.abort();
   await server.close();
   await mockModel?.close();
   const resolved = path.resolve(owned);

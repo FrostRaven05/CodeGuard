@@ -28,6 +28,11 @@ const response = (value = goodResult) => ({
   usage: { total_tokens: 123 },
 });
 
+const streamEvent = (value) => `data: ${JSON.stringify(value)}\n\n`;
+const streamDelta = (content) => ({
+  choices: [{ index: 0, delta: { content }, finish_reason: null }],
+});
+
 function temporary(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codeguard-review-test-'));
   t.after(() => {
@@ -213,6 +218,8 @@ test('评审只发送固定暂存版本，排除敏感路径、二进制、链�
   assert.match(payload, /export const value = 0/);
   assert.doesNotMatch(payload, /UNSTAGED_CANARY|PRIVATE_CANARY|outside-private/);
   assert.equal(result.findings.length, 1);
+  assert.deepEqual(result.usage, { promptTokens: null, completionTokens: null, totalTokens: 123 });
+  assert.equal(f.reviews.metrics.get(f.id).usage.totalTokens, 123);
   assert.equal(result.hasRequirements, false);
   assert.equal(result.findings[0].evidenceStatus, 'AI 推断待确认');
   assert.equal((await f.reviews.state(f.id)).latest.stale, false);
@@ -460,4 +467,546 @@ test('请求不跟随重定向，超大和无效服务响应不会被接受', as
       { code },
     );
   }
+});
+
+test('上下文关联暂存函数、直接引用和测试；删除读取父版本，不读未暂存内容', async (t) => {
+  const f = await fixture(t, () => response({ summary: '函数变化', findings: [] }));
+  f.write('source.ts', 'export function amount(value) {\n  return value ?? 10;\n}\n');
+  f.write('caller.ts', 'import { amount } from "./source";\nexport const total = amount(0);\n');
+  f.write(
+    'tests/source.test.ts',
+    'import { amount } from "../source";\nassert.equal(amount(0), 0);\n',
+  );
+  f.write('gone.py', 'def gone(value):\n    return value + 1\n');
+  await runGit(f.repo, ['add', '--all']);
+  await runGit(f.repo, ['commit', '-m', 'context baseline']);
+  f.write('source.ts', 'export function amount(value) {\n  return value || 10;\n}\n');
+  fs.unlinkSync(path.join(f.repo, 'gone.py'));
+  await runGit(f.repo, ['add', '--all']);
+  f.write('caller.ts', 'UNSTAGED_CALLER_CANARY');
+  f.write('source.ts', 'UNSTAGED_SOURCE_CANARY');
+  const preview = await f.reviews.prepare(f.id);
+  assert.ok(
+    preview.contexts.some(
+      (item) => item.path === 'source.ts' && item.side === 'new' && item.startLine === 1,
+    ),
+  );
+  assert.equal(
+    preview.contexts.find((item) => item.path === 'source.ts' && item.side === 'new').endLine,
+    3,
+  );
+  assert.ok(
+    preview.contexts.some((item) => item.path === 'caller.ts' && item.kind.includes('引用')),
+  );
+  assert.ok(
+    preview.contexts.some(
+      (item) => item.path === 'tests/source.test.ts' && item.kind.includes('测试'),
+    ),
+  );
+  assert.ok(
+    preview.contexts.some(
+      (item) => item.path === 'gone.py' && item.side === 'old' && item.revision === preview.head,
+    ),
+  );
+  await f.reviews.start(f.id, preview.token);
+  const payload = JSON.parse(f.server.requests[0].body.messages[1].content);
+  assert.doesNotMatch(JSON.stringify(payload), /UNSTAGED_/);
+  assert.ok(payload.contexts.some((item) => item.text.includes('amount(0)')));
+  assert.equal((await f.reviews.state(f.id)).latest.stale, false);
+  const nextPreview = await f.reviews.prepare(f.id);
+  await runGit(f.repo, ['add', '--', 'caller.ts']);
+  assert.equal((await f.reviews.state(f.id)).latest.stale, true);
+  await assert.rejects(f.reviews.start(f.id, nextPreview.token), { code: 'STALE_REVIEW' });
+});
+
+test('上下文共同遵守排除、密钥检测、链接隔离和总请求预算', async (t) => {
+  const f = await fixture(t, () => response({ summary: '检查上下文', findings: [] }));
+  f.write('source.ts', 'export function amount(value) {\n  return value ?? 10;\n}\n');
+  f.write('hidden.ts', 'amount("EXCLUDED_CONTEXT_CANARY");\n');
+  f.write('token-bearing.ts', 'const apiKey = "SECRET_CONTEXT_CANARY_12345";\namount(0);\n');
+  f.write('large.ts', 'amount(0);\n' + '// large\n'.repeat(8000));
+  await runGit(f.repo, ['add', '--all']);
+  const linkHash = (
+    await runGit(f.repo, ['hash-object', '-w', '--stdin'], { input: '../outside-private' })
+  ).stdout.trim();
+  await runGit(f.repo, ['update-index', '--add', '--cacheinfo', `120000,${linkHash},link.ts`]);
+  await runGit(f.repo, ['commit', '-m', 'baseline']);
+  f.write('source.ts', 'export function amount(value) {\n  return value || 10;\n}\n');
+  await runGit(f.repo, ['add', '--', 'source.ts']);
+  f.settings.save({
+    ...f.settings.getPublic(),
+    maxContextChars: 4000,
+    excludePatterns: 'hidden.ts',
+  });
+  const preview = await f.reviews.prepare(f.id);
+  assert.ok(
+    preview.contextSkipped.some(
+      (item) => item.path === 'hidden.ts' && item.reason.includes('排除'),
+    ),
+  );
+  assert.ok(
+    preview.contextSkipped.some(
+      (item) => item.path === 'token-bearing.ts' && item.reason.includes('密钥'),
+    ),
+  );
+  assert.ok(
+    preview.contextSkipped.some(
+      (item) => item.path === 'link.ts' && item.reason.includes('符号链接'),
+    ),
+  );
+  assert.ok(preview.contextSkipped.some((item) => item.path === 'large.ts'));
+  await f.reviews.start(f.id, preview.token);
+  const messages = f.server.requests[0].body.messages;
+  assert.ok(messages.reduce((sum, item) => sum + item.content.length, 0) <= 4000);
+  assert.doesNotMatch(JSON.stringify(messages), /CONTEXT_CANARY|outside-private/);
+});
+
+test('规范需求与结果检测敏感内容；排除路径不进入问题交接，部分行摘录不被接受', async (t) => {
+  const f = await fixture(t, () =>
+    response({ summary: 'source.ts 与 hidden.ts 的变化', findings: [] }),
+  );
+  f.write('hidden.ts', 'EXCLUDED_CANARY\n');
+  await runGit(f.repo, ['add', '--all']);
+  f.settings.save({ ...f.settings.getPublic(), excludePatterns: 'hidden.ts' });
+  f.reviews.saveOptions(f.id, {
+    standards: 'apiKey = "SECRET_OPTIONS_CANARY_12345"',
+    requirements: '',
+  });
+  await assert.rejects(f.reviews.prepare(f.id), { code: 'REVIEW_SENSITIVE_OPTIONS' });
+  f.reviews.saveOptions(f.id, { standards: '查看 hidden.ts', requirements: '' });
+  await assert.rejects(f.reviews.prepare(f.id), { code: 'REVIEW_SENSITIVE_OPTIONS' });
+  f.reviews.saveOptions(f.id, { standards: '', requirements: '' });
+  const preview = await f.reviews.prepare(f.id);
+  const result = await f.reviews.start(f.id, preview.token);
+  assert.doesNotMatch(result.summary, /hidden.ts/);
+  const invalid = normalizeResult(
+    JSON.stringify({ summary: '变化', findings: [{ ...goodFinding, evidence: 'value = 0' }] }),
+    [{ path: 'source.ts', text: '@@ -0,0 +1 @@\n+export const value = 0;\n' }],
+    false,
+  );
+  assert.equal(invalid.findings.length, 0);
+});
+
+test('上下文不足与未支持语言不会擦除已纳入差异的问题；敏感模型结果不保存', async (t) => {
+  let unsafe = false;
+  const f = await fixture(t, () =>
+    response(
+      unsafe
+        ? { summary: 'apiKey = "UNSAFE_RESULT_CANARY_12345"', findings: [] }
+        : {
+            summary: '检查 Rust 差异',
+            findings: [
+              { ...goodFinding, path: 'source.rs', evidence: 'pub const VALUE: i32 = 0;' },
+            ],
+          },
+    ),
+  );
+  f.write('source.rs', 'pub const VALUE: i32 = 0;\n');
+  await runGit(f.repo, ['add', '--all']);
+  let preview = await f.reviews.prepare(f.id);
+  const result = await f.reviews.start(f.id, preview.token);
+  assert.equal(result.findings.length, 1);
+  assert.ok(preview.contextSkipped.some((file) => file.path === 'source.rs'));
+  unsafe = true;
+  preview = await f.reviews.prepare(f.id);
+  await assert.rejects(f.reviews.start(f.id, preview.token), { code: 'REVIEW_UNSAFE_RESULT' });
+  assert.equal(f.reviews.metrics.get(f.id).usage.totalTokens, 123);
+  assert.equal((await f.reviews.state(f.id)).latest.id, result.id);
+  assert.doesNotMatch(fs.readFileSync(f.reviews.file(f.id), 'utf8'), /UNSAFE_RESULT_CANARY/);
+});
+
+test('四样例验证工具完整运行、报告区分协议与人工语义，失败即停并保留实际用量', async (t) => {
+  const { validateModel } = require('../scripts/model-validation-runner.cjs');
+  const { cases, scoreCase } = require('./fixtures/review-cases.cjs');
+  let fail = false;
+  const f = await fixture(t, () =>
+    response(fail ? { summary: 'invalid' } : { summary: '合成样例模拟响应', findings: [] }),
+  );
+  const settingsBefore = fs.readFileSync(f.settings.file, 'utf8');
+  const destination = path.join(f.directory, 'reports');
+  const progress = [];
+  let retainedDirectory;
+  t.after(() => {
+    if (!retainedDirectory) return;
+    const resolved = path.resolve(retainedDirectory);
+    assert.equal(path.dirname(resolved), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(resolved).startsWith('codeguard-model-validation-'));
+    fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  const output = await validateModel(f.settings, {
+    reportDirectory: destination,
+    kind: 'mock-validation-test',
+    onProgress: (item) => progress.push(item),
+    cleanupImpl: (directory) => {
+      retainedDirectory = directory;
+      throw Object.assign(new Error('Synthetic cleanup lock'), { code: 'EBUSY' });
+    },
+  });
+  assert.equal(output.report.cleanup.status, 'retained');
+  assert.equal(output.report.cleanup.errorCode, 'EBUSY');
+  assert.equal(JSON.parse(fs.readFileSync(output.reportFile, 'utf8')).cleanup.errorCode, 'EBUSY');
+  assert.equal(output.report.cases.length, 4);
+  assert.equal(f.server.requests.length, 4);
+  assert.equal(progress.length, 4);
+  assert.equal(output.report.kind, 'mock-validation-test');
+  for (const record of output.report.cases) {
+    assert.equal(record.protocol, 'accepted-json');
+    assert.equal(record.usage.totalTokens, 123);
+    assert.equal(record.cost, null);
+    assert.equal(scoreCase(record).status, 'pending-human-assessment');
+    assert.ok(record.preview.contexts.some((item) => item.path.startsWith('test_')));
+  }
+  for (const request of f.server.requests) {
+    const payload = request.body.messages[1].content;
+    assert.ok(!payload.includes('expected'));
+    for (const item of cases) assert.ok(!payload.includes(item.oracle));
+  }
+  assert.doesNotMatch(fs.readFileSync(output.reportFile, 'utf8'), /fixture-only-key|encryptedKey/);
+  assert.equal(fs.readFileSync(f.settings.file, 'utf8'), settingsBefore);
+  fail = true;
+  const failed = await validateModel(f.settings, {
+    reportDirectory: destination,
+    kind: 'mock-validation-test',
+  });
+  assert.equal(failed.report.cases.length, 1);
+  assert.equal(failed.report.cleanup.status, 'completed');
+  assert.equal(f.server.requests.length, 5);
+  assert.equal(failed.report.cases[0].errorCode, 'REVIEW_INVALID_RESULT');
+  assert.equal(failed.report.cases[0].usage.totalTokens, 123);
+  assert.equal(scoreCase(failed.report.cases[0]).falseNegatives, null);
+});
+
+test('提交信息只发送固定暂存差异，预览不调用模型，草稿由用户确认后填写', async (t) => {
+  const f = await fixture(t, () => response({ message: '新增默认值处理\n\n保留零值作为默认值。' }));
+  f.write('source.ts', 'WORKTREE_ONLY_MARKER\n');
+  f.write('untracked.ts', 'UNTRACKED_ONLY_MARKER\n');
+  f.git.saveDraft(f.id, '用户原草稿');
+  const before = await runGit(f.repo, ['diff', '--cached']);
+  const handlers = createHandlers(f.git, async () => null, f.reviews);
+  const preview = await invoke(handlers, 'prepareCommitMessage', [f.id]);
+  assert.equal(preview.ok, true);
+  assert.deepEqual(
+    preview.value.included.map((item) => item.path),
+    ['source.ts'],
+  );
+  assert.equal(f.server.requests.length, 0);
+  const result = await invoke(handlers, 'generateCommitMessage', [f.id, preview.value.token]);
+  assert.equal(result.ok, true);
+  assert.match(result.value.message, /新增默认值处理/);
+  assert.equal(result.value.partial, false);
+  assert.equal(result.value.totalTokens, 123);
+  assert.equal(f.git.getWorkspace().drafts[f.id], '用户原草稿');
+  const sent = JSON.stringify(f.server.requests[0].body);
+  assert.match(sent, /export const value = 0/);
+  assert.doesNotMatch(sent, /WORKTREE_ONLY_MARKER|UNTRACKED_ONLY_MARKER|用户原草稿/);
+  assert.equal((await runGit(f.repo, ['diff', '--cached'])).stdout, before.stdout);
+  assert.equal(fs.readFileSync(path.join(f.repo, 'source.ts'), 'utf8'), 'WORKTREE_ONLY_MARKER\n');
+  assert.equal(
+    (await invoke(handlers, 'generateCommitMessage', [f.id, preview.value.token])).ok,
+    false,
+  );
+});
+
+test('提交信息排除敏感路径、内容和二进制，空范围不发送', async (t) => {
+  const f = await fixture(t, () => response({ message: '新增处理逻辑' }));
+  f.write('.env.local', 'PRIVATE_ENV_MARKER=hidden\n');
+  f.write('hidden.ts', 'export const password = "a-long-private-password";\n');
+  f.write('ignored.ts', 'EXCLUDED_CONTENT_MARKER\n');
+  f.write('binary.bin', Buffer.from([0, 1, 2]));
+  await runGit(f.repo, ['add', '--', '.']);
+  f.settings.save({ ...f.settings.getPublic(), excludePatterns: 'ignored.ts' });
+  const preview = await f.reviews.commitMessages.prepare(f.id);
+  assert.deepEqual(
+    preview.included.map((file) => file.path),
+    ['source.ts'],
+  );
+  assert.equal(preview.skipped.length, 4);
+  const result = await f.reviews.commitMessages.start(f.id, preview.token);
+  assert.equal(result.partial, true);
+  assert.doesNotMatch(
+    JSON.stringify(f.server.requests),
+    /PRIVATE_ENV_MARKER|EXCLUDED_CONTENT_MARKER|private-password|ignored.ts|hidden.ts|binary.bin|env.local/,
+  );
+  f.settings.save({ ...f.settings.getPublic(), excludePatterns: '**' });
+  const empty = await f.reviews.commitMessages.prepare(f.id);
+  await assert.rejects(f.reviews.commitMessages.start(f.id, empty.token), {
+    code: 'COMMIT_MESSAGE_EMPTY',
+  });
+  assert.equal(f.server.requests.length, 1);
+});
+
+test('提交信息生成前的暂存或模型变化拒绝发送，生成后的变化拒绝旧结果', async (t) => {
+  const f = await fixture(t, async () => {
+    f.write('source.ts', 'export const value = 3;\n');
+    await runGit(f.repo, ['add', '--', 'source.ts']);
+    return response({ message: '旧版本信息' });
+  });
+  const old = await f.reviews.commitMessages.prepare(f.id);
+  f.settings.save({ ...f.settings.getPublic(), model: 'changed-model' });
+  await assert.rejects(f.reviews.commitMessages.start(f.id, old.token), {
+    code: 'STALE_COMMIT_MESSAGE',
+  });
+  assert.equal(f.server.requests.length, 0);
+  const preview = await f.reviews.commitMessages.prepare(f.id);
+  f.git.saveDraft(f.id, '保留的草稿');
+  await assert.rejects(f.reviews.commitMessages.start(f.id, preview.token), {
+    code: 'STALE_COMMIT_MESSAGE',
+  });
+  assert.equal(f.git.getWorkspace().drafts[f.id], '保留的草稿');
+  const changed = await f.reviews.commitMessages.prepare(f.id);
+  f.write('source.ts', 'export const value = 4;\n');
+  await runGit(f.repo, ['add', '--', 'source.ts']);
+  await assert.rejects(f.reviews.commitMessages.start(f.id, changed.token), {
+    code: 'STALE_COMMIT_MESSAGE',
+  });
+  assert.equal(f.server.requests.length, 1);
+});
+
+test('提交信息错误、无效和敏感结果都保留原草稿', async (t) => {
+  for (const result of [
+    null,
+    { message: '' },
+    { message: 'bad\u0000text' },
+    { message: 'password = "long-private-secret"' },
+  ]) {
+    await t.test(JSON.stringify(result), async (t) => {
+      const f = await fixture(t, () => response(result));
+      f.git.saveDraft(f.id, '原草稿');
+      const preview = await f.reviews.commitMessages.prepare(f.id);
+      await assert.rejects(f.reviews.commitMessages.start(f.id, preview.token), {
+        code: 'COMMIT_MESSAGE_INVALID',
+      });
+      assert.equal(f.git.getWorkspace().drafts[f.id], '原草稿');
+    });
+  }
+});
+
+test('提交信息取消请求、重复请求互斥且之后可重试', async (t) => {
+  let entered;
+  const received = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const f = await fixture(t, async () => {
+    entered();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return response({ message: '生成的草稿' });
+  });
+  f.git.saveDraft(f.id, '原草稿');
+  const preview = await f.reviews.commitMessages.prepare(f.id);
+  const running = f.reviews.commitMessages.start(f.id, preview.token);
+  const rejection = assert.rejects(running, { code: 'COMMIT_MESSAGE_CANCELLED' });
+  await received;
+  await assert.rejects(f.reviews.commitMessages.start(f.id, preview.token), {
+    code: 'COMMIT_MESSAGE_RUNNING',
+  });
+  f.reviews.commitMessages.cancel(f.id);
+  await rejection;
+  assert.equal(f.git.getWorkspace().drafts[f.id], '原草稿');
+  const retry = await f.reviews.commitMessages.prepare(f.id);
+  assert.equal((await f.reviews.commitMessages.start(f.id, retry.token)).message, '生成的草稿');
+});
+
+test('提交信息预算限制完整差异，排除文件改名后仍不会发送', async (t) => {
+  const f = await fixture(t, () => response({ message: '新增普通逻辑' }));
+  f.write('excluded.ts', 'SECRET_PATH_MARKER\n');
+  await runGit(f.repo, ['add', '--', '.']);
+  await runGit(f.repo, ['commit', '-m', 'base']);
+  await runGit(f.repo, ['mv', '--', 'excluded.ts', 'renamed.ts']);
+  f.write('source.ts', 'export const value = 1;\n');
+  f.write('large.ts', 'x'.repeat(30000));
+  await runGit(f.repo, ['add', '--', '.']);
+  f.settings.save({
+    ...f.settings.getPublic(),
+    maxContextChars: 8000,
+    excludePatterns: 'excluded.ts',
+  });
+  const preview = await f.reviews.commitMessages.prepare(f.id);
+  assert.deepEqual(
+    preview.included.map((item) => item.path),
+    ['source.ts'],
+  );
+  assert.ok(preview.skipped.some((item) => item.path === 'renamed.ts'));
+  assert.ok(preview.skipped.some((item) => item.path === 'large.ts'));
+  assert.ok(preview.chars <= 8000);
+  await f.reviews.commitMessages.start(f.id, preview.token);
+  const sent = JSON.stringify(f.server.requests.at(-1).body.messages);
+  assert.doesNotMatch(sent, /SECRET_PATH_MARKER|excluded.ts|renamed.ts|large.ts/);
+  assert.ok(sent.length <= 8000);
+});
+
+test('组件化图示绑定暂存证据并持久化，旧记录无图示仍可读取', async (t) => {
+  const location = { path: 'source.ts', side: 'new', line: 1, evidence: 'export const value = 0;' };
+  const visuals = {
+    changes: [{ title: '新增默认值', before: '未提供默认值', after: '提供零值', location }],
+    flows: [
+      {
+        title: '默认值流程',
+        nodes: [
+          { id: 'read', label: '读取零值', kind: 'start', location },
+          { id: 'use', label: '由调用方使用', kind: 'end', location: null },
+        ],
+        edges: [{ from: 'read', to: 'use', label: '传递' }],
+      },
+    ],
+  };
+  const f = await fixture(t, () => response({ ...goodResult, visuals }));
+  f.write('source.ts', 'UNSTAGED_VISUAL_MARKER\n');
+  const preview = await f.reviews.prepare(f.id);
+  const generated = await f.reviews.start(f.id, preview.token);
+  assert.deepEqual(generated.visuals, visuals);
+  assert.equal(generated.visualsRejected, 0);
+  const reloaded = new ReviewService(f.git, f.settings);
+  assert.deepEqual((await reloaded.state(f.id)).latest.visuals, visuals);
+  assert.doesNotMatch(JSON.stringify(f.server.requests), /UNSTAGED_VISUAL_MARKER/);
+  assert.match(f.server.requests[0].body.messages[0].content, /visuals/);
+  const data = reloaded.load(f.id);
+  delete data.latest.visuals;
+  delete data.latest.visualsRejected;
+  fs.writeFileSync(reloaded.file(f.id), JSON.stringify(data));
+  assert.equal((await reloaded.state(f.id)).latest.summary, goodResult.summary);
+  assert.equal((await reloaded.state(f.id)).latest.stale, false);
+});
+
+test('SSE 在完成前推送摘要与已核对位置的问题，过程按范围隔离且最终用量正确', async (t) => {
+  const gate = Promise.withResolvers(),
+    sent = Promise.withResolvers();
+  t.after(() => gate.resolve());
+  const content = JSON.stringify(goodResult);
+  const f = await fixture(t, async (body, output) => {
+    assert.equal(body.stream, true);
+    output.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    output.write(streamEvent(streamDelta(content.slice(0, -2))));
+    sent.resolve();
+    await gate.promise;
+    if (output.destroyed) return;
+    output.write(streamEvent(streamDelta(content.slice(-2))));
+    output.write(streamEvent({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+    output.write(streamEvent({ choices: [], usage: { total_tokens: 17 } }));
+    output.end('data: [DONE]\n\n');
+  });
+  const events = [];
+  const unsubscribe = f.reviews.subscribeProgress((item) => events.push(item));
+  t.after(unsubscribe);
+  const preview = await f.reviews.prepare(f.id);
+  const running = f.reviews.start(f.id, preview.token);
+  await sent.promise;
+  await new Promise((resolve) => {
+    if (f.reviews.reviewProgress(f.id).findings.length) return resolve();
+    const remove = f.reviews.subscribeProgress((item) => {
+      if (item.findings.length) {
+        remove();
+        resolve();
+      }
+    });
+    t.after(remove);
+  });
+  const live = f.reviews.reviewProgress(f.id);
+  assert.equal(live.status, 'running');
+  assert.equal(live.summary, goodResult.summary);
+  assert.equal(live.findings.length, 1);
+  assert.equal((await f.reviews.state(f.id)).latest, null);
+  assert.equal(f.reviews.reviewProgress(f.id, 'local'), null);
+  live.summary = 'mutated';
+  assert.equal(f.reviews.reviewProgress(f.id).summary, goodResult.summary);
+  gate.resolve();
+  const result = await running;
+  assert.equal(result.totalTokens, 17);
+  assert.equal(result.findings.length, 1);
+  assert.equal(f.reviews.reviewProgress(f.id).status, 'completed');
+  assert.deepEqual(
+    events
+      .map((event) => event.phase)
+      .filter((phase, index, all) => index === 0 || all[index - 1] !== phase),
+    ['validating', 'requesting', 'receiving', 'checking', 'saving', 'completed'],
+  );
+  assert.ok(!fs.readFileSync(f.reviews.file(f.id), 'utf8').includes('receivedChars'));
+});
+
+test('流式取消立即停止等待，不保存半成品并保留上次结果与提交草稿', async (t) => {
+  let streaming = false;
+  const sent = Promise.withResolvers();
+  const f = await fixture(t, (_body, output) => {
+    if (!streaming) return response();
+    output.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    output.write(streamEvent(streamDelta('{"summary":"未完成的摘要')));
+    sent.resolve();
+    // A streaming service can remain idle until cancellation closes the connection.
+    return new Promise((resolve) => output.on('close', resolve));
+  });
+  const previous = await f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  f.git.saveDraft(f.id, '保留提交说明');
+  streaming = true;
+  const running = f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  const cancelled = assert.rejects(running, { code: 'REVIEW_CANCELLED' });
+  await sent.promise;
+  f.reviews.cancel(f.id);
+  await cancelled;
+  const state = await f.reviews.state(f.id);
+  assert.equal(state.latest.id, previous.id);
+  assert.equal(state.running, false);
+  assert.equal(state.progress.status, 'cancelled');
+  assert.equal(state.progress.summary, '');
+  assert.equal(f.git.getWorkspace().drafts[f.id], '保留提交说明');
+});
+
+test('流式预览屏蔽排除路径、未核对问题和完整敏感字段；失败保留旧结果', async (t) => {
+  let mode = 'baseline';
+  const gate = Promise.withResolvers(),
+    sent = Promise.withResolvers();
+  t.after(() => gate.resolve());
+  const f = await fixture(t, async (_body, output) => {
+    if (mode === 'baseline') return response();
+    output.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    if (mode === 'preview') {
+      const value = {
+        summary: '检查 private/notes.txt 与 fixture-only-key',
+        findings: [{ ...goodFinding, line: 1000 }],
+      };
+      output.write(streamEvent(streamDelta(JSON.stringify(value).slice(0, -2))));
+      sent.resolve();
+      await gate.promise;
+      if (output.destroyed) return;
+      output.write(streamEvent(streamDelta(']}')));
+    } else {
+      output.write(
+        streamEvent(
+          streamDelta(
+            JSON.stringify({ summary: 'password = "private-stream-secret"', findings: [] }),
+          ),
+        ),
+      );
+    }
+    output.write(streamEvent({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+    output.end('data: [DONE]\n\n');
+  });
+  f.settings.save({ ...f.settings.getPublic(), excludePatterns: 'private' });
+  const previous = await f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  mode = 'preview';
+  const events = [];
+  const remove = f.reviews.subscribeProgress((value) => events.push(value));
+  t.after(remove);
+  const running = f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  await sent.promise;
+  await new Promise((resolve) => {
+    if (f.reviews.reviewProgress(f.id).summary) return resolve();
+    const unsubscribe = f.reviews.subscribeProgress((value) => {
+      if (value.summary) {
+        unsubscribe();
+        resolve();
+      }
+    });
+    t.after(unsubscribe);
+  });
+  assert.doesNotMatch(JSON.stringify(events), /private\/notes|fixture-only-key/);
+  assert.equal(f.reviews.reviewProgress(f.id).findings.length, 0);
+  gate.resolve();
+  const completed = await running;
+  assert.notEqual(completed.id, previous.id);
+  mode = 'unsafe';
+  await assert.rejects(f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token), {
+    code: 'REVIEW_UNSAFE_RESULT',
+  });
+  assert.doesNotMatch(JSON.stringify(events), /private-stream-secret/);
+  assert.equal((await f.reviews.state(f.id)).latest.id, completed.id);
+  assert.equal(f.reviews.reviewProgress(f.id).status, 'failed');
 });

@@ -18,6 +18,12 @@ async function createWorkbenchWindow(
     minWidth: 1080,
     minHeight: 700,
     title: 'CodeGuard',
+    ...(process.platform === 'win32'
+      ? {
+          titleBarStyle: 'hidden',
+          titleBarOverlay: { color: '#1a1e25', symbolColor: '#c5cdd9', height: 55 },
+        }
+      : {}),
     backgroundColor: '#12151b',
     show: false,
     webPreferences: {
@@ -42,6 +48,9 @@ async function createWorkbenchWindow(
     service,
     new ModelSettings(path.dirname(service.storageFile), { safeStorage }),
   );
+  const unsubscribeProgress = reviews.subscribeProgress((progress) => {
+    if (!window.isDestroyed()) window.webContents.send('codeguard:review-progress', progress);
+  });
   const handlers = createHandlers(
     service,
     chooseDirectory ||
@@ -67,8 +76,10 @@ async function createWorkbenchWindow(
   });
   window.on('focus', () => window.webContents.send('codeguard:changed'));
   window.on('closed', () => {
+    unsubscribeProgress();
     ipcMain.removeHandler('codeguard:invoke');
     for (const controller of reviews.running.values()) controller.abort();
+    for (const controller of reviews.commitMessages.running.values()) controller.abort();
   });
   if (visible) window.once('ready-to-show', () => window.show());
   if (developmentUrl) await window.loadURL(developmentUrl);

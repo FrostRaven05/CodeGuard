@@ -4,12 +4,16 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowLeft,
+  ArrowRight,
+  Search,
+  PanelLeftClose,
+  PanelLeftOpen,
   ArrowUp,
   Check,
   CheckCircle2,
   ChevronRight,
   Settings2,
-  Circle,
+  Sparkles,
   FileCode2,
   FileDiff,
   Files,
@@ -18,7 +22,7 @@ import {
   GitBranch,
   GitCommitHorizontal,
   GitMerge,
-  History,
+  Globe,
   LoaderCircle,
   Minus,
   Plus,
@@ -31,7 +35,15 @@ import { DiffView } from './DiffView';
 import { layoutGraph } from './graph';
 import { ModelSettingsDialog } from './ModelSettingsDialog';
 import { ReviewPanel } from './ReviewPanel';
+import { ReviewWorkspace, type ReviewView } from './ReviewWorkspace';
+import { RepositoryPicker } from './RepositoryPicker';
+import { BranchMenu } from './BranchMenu';
+import { GitOperationDialog, operationLabels } from './GitOperationDialog';
+import { CommitMessageComposer } from './CommitMessageComposer';
+import { RemoteSettingsDialog } from './RemoteSettingsDialog';
 import type {
+  Branch,
+  ReviewScope,
   ChangeFile,
   Commit,
   CommitDetails,
@@ -40,8 +52,9 @@ import type {
   DiffSelection,
   RepositoryState,
   Workspace,
-  Finding,
   ReviewState,
+  GitOperationRequest,
+  CodeLocation,
 } from './types';
 
 type Notice = { kind: 'error' | 'success' | 'warning'; message: string; details?: string };
@@ -64,11 +77,22 @@ const dateLabel = (date: string) =>
 export function App() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [state, setState] = useState<RepositoryState | null>(null);
-  const [view, setView] = useState<'changes' | 'history'>('changes');
+  const [view, setView] = useState<'changes' | 'history' | 'review'>('changes');
   const [selection, setSelection] = useState<DiffSelection | null>(null);
   const [diff, setDiff] = useState<DiffResult | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [history, setHistory] = useState<Commit[]>([]);
+  const [historyRef, setHistoryRef] = useState('');
+  const [historySearch, setHistorySearch] = useState('');
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyCursor, setHistoryCursor] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const [diffFilesOpen, setDiffFilesOpen] = useState(true);
+  const [reviewScope, setReviewScope] = useState<ReviewScope>('local');
+  const [commitReviewInfo, setCommitReviewInfo] = useState<ReviewState | null>(null);
   const [selectedCommit, setSelectedCommit] = useState<string | null>(null);
   const [commitDetails, setCommitDetails] = useState<CommitDetails | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -81,9 +105,13 @@ export function App() {
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [remotesOpen, setRemotesOpen] = useState(false);
+  const [remoteReturn, setRemoteReturn] = useState<GitOperationRequest | null>(null);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [reviewInfo, setReviewInfo] = useState<ReviewState | null>(null);
-  const [findingFocus, setFindingFocus] = useState<Finding | null>(null);
+  const [reviewView, setReviewView] = useState<ReviewView>({ tab: 'changes', file: '' });
+  const [findingFocus, setFindingFocus] = useState<CodeLocation | null>(null);
+  const [gitOperation, setGitOperation] = useState<GitOperationRequest | null>(null);
   const activeId = workspace?.activeRepositoryId || null;
   const repository = workspace?.repositories.find((item) => item.id === activeId);
   const activeIdRef = useRef(activeId);
@@ -92,6 +120,8 @@ export function App() {
   busyRef.current = busy;
   const refreshCounter = useRef(0);
   const historyKey = useRef('');
+  const historyRequest = useRef(0);
+  const overviewScroll = useRef<Record<string, number>>({ changes: 0, history: 0 });
   const draftQueue = useRef(new Map<string, Promise<unknown>>());
   const closePreviewButton = useRef<HTMLButtonElement>(null);
   const previewButton = useRef<HTMLButtonElement>(null);
@@ -123,15 +153,8 @@ export function App() {
       setUpdatedAt(new Date());
       const key = `${id}:${next.head}:${next.branches.map((branch) => `${branch.name}:${branch.hash}`).join('|')}`;
       if (historyKey.current !== key) {
-        const commits = await api.history(id);
-        if (activeIdRef.current !== id || request !== refreshCounter.current) return;
         historyKey.current = key;
-        setHistory(commits);
-        setSelectedCommit((selected) =>
-          selected && commits.some((commit) => commit.hash === selected)
-            ? selected
-            : commits[0]?.hash || null,
-        );
+        setHistoryVersion((value) => value + 1);
       }
     } catch (error) {
       if (activeIdRef.current === id && request === refreshCounter.current)
@@ -146,6 +169,13 @@ export function App() {
     historyKey.current = '';
     setState(null);
     setHistory([]);
+    setHistoryRef('');
+    setHistorySearch('');
+    setHistoryQuery('');
+    setReviewScope('local');
+    setCommitReviewInfo(null);
+    overviewScroll.current = { changes: 0, history: 0 };
+    historyRequest.current++;
     setSelectedCommit(null);
     setCommitDetails(null);
     setSelection(null);
@@ -153,7 +183,11 @@ export function App() {
     setPreview(null);
     setPreviewOpen(false);
     setReviewInfo(null);
+    setReviewView({ tab: 'changes', file: '' });
+    setRemotesOpen(false);
+    setRemoteReturn(null);
     setFindingFocus(null);
+    setGitOperation(null);
     setView('changes');
     if (!activeId) return;
     void refresh(activeId);
@@ -169,14 +203,99 @@ export function App() {
   }, [activeId, refresh]);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setHistoryQuery(historySearch.trim()), 250);
+    return () => window.clearTimeout(timer);
+  }, [historySearch]);
+
+  useEffect(() => {
+    if (!activeId || state?.repositoryId !== activeId) return;
+    let disposed = false;
+    const generation = ++historyRequest.current;
+    setHistoryLoading(true);
+    setHistoryError('');
+    setHistory([]);
+    setHistoryHasMore(false);
+    void api
+      .historyPage(activeId, { ref: historyRef, query: historyQuery })
+      .then((page) => {
+        if (disposed || generation !== historyRequest.current) return;
+        setHistory(page.commits);
+        setHistoryHasMore(page.hasMore);
+        setHistoryCursor(page.nextSkip);
+        setSelectedCommit((selected) =>
+          page.commits.some((item) => item.hash === selected)
+            ? selected
+            : page.commits[0]?.hash || null,
+        );
+      })
+      .catch((error) => {
+        if (!disposed && generation === historyRequest.current) setHistoryError(error.message);
+      })
+      .finally(() => {
+        if (!disposed && generation === historyRequest.current) setHistoryLoading(false);
+      });
+    return () => {
+      disposed = true;
+      historyRequest.current++;
+    };
+  }, [activeId, state?.repositoryId, historyRef, historyQuery, historyVersion]);
+
+  async function loadMoreHistory() {
+    if (!activeId || historyLoading || !historyHasMore) return;
+    const generation = historyRequest.current;
+    setHistoryLoading(true);
+    setHistoryError('');
+    try {
+      const page = await api.historyPage(activeId, {
+        ref: historyRef,
+        query: historyQuery,
+        skip: historyCursor,
+      });
+      if (generation !== historyRequest.current) return;
+      setHistory((previous) => [
+        ...new Map([...previous, ...page.commits].map((item) => [item.hash, item])).values(),
+      ]);
+      setHistoryHasMore(page.hasMore);
+      setHistoryCursor(page.nextSkip);
+    } catch (error) {
+      if (generation === historyRequest.current)
+        setHistoryError(error instanceof Error ? error.message : '无法加载历史');
+    } finally {
+      if (generation === historyRequest.current) setHistoryLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!previewOpen || !activeId) return;
+    let disposed = false;
+    void api
+      .reviewState(activeId, 'staged')
+      .then((value) => {
+        if (!disposed) setCommitReviewInfo(value);
+      })
+      .catch(() => {
+        if (!disposed) setCommitReviewInfo(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [previewOpen, activeId, state?.indexRevision, settingsVersion]);
+
+  useEffect(() => {
     if (!activeId || !selection) {
       setDiff(null);
       return;
     }
     let disposed = false;
     setDiffLoading(true);
-    api
-      .diff(activeId, selection)
+    (selection.scope === 'review'
+      ? api.reviewDiff(activeId, {
+          scope: selection.reviewScope || 'staged',
+          reviewId: selection.reviewId || '',
+          path: selection.path,
+        })
+      : api.diff(activeId, selection)
+    )
       .then((result) => {
         if (!disposed) setDiff(result);
       })
@@ -234,6 +353,9 @@ export function App() {
     ) || [];
   const untracked = state?.files.filter((file) => file.untracked) || [];
   const conflicts = state?.files.filter((file) => file.conflict).length || 0;
+  const canStageAll =
+    !!state && !busy && !conflicts && !state.locked && !!(unstaged.length || untracked.length);
+  const selectedFile = state?.files.find((file) => file.path === selection?.path);
   const draft = activeId ? drafts[activeId] || '' : '';
   const graph = useMemo(() => layoutGraph(history), [history]);
   const previewStale =
@@ -340,6 +462,31 @@ export function App() {
     }
   }
 
+  async function stageAll() {
+    if (!activeId || busyRef.current) return;
+    const id = activeId;
+    setBusy('暂存全部');
+    setNotice(null);
+    try {
+      const next = await api.stageAll(id);
+      if (activeIdRef.current !== id) return;
+      setState(next);
+      setUpdatedAt(new Date());
+      setNotice({ kind: 'success', message: '已暂存全部改动。' });
+      setSelection((current) => {
+        if (!current || current.scope === 'commit' || current.scope === 'review') return current;
+        const file = next.files.find((item) => item.path === current.path);
+        return file ? { path: file.path, scope: 'index' } : null;
+      });
+      await refresh(id, true);
+    } catch (error) {
+      if (activeIdRef.current === id) setNotice(errorNotice(error));
+      await refresh(id, true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function commit() {
     if (!activeId || !preview) return;
     const id = activeId;
@@ -367,14 +514,72 @@ export function App() {
     }
   }
 
-  function selectView(next: 'changes' | 'history') {
+  function selectView(next: 'changes' | 'history' | 'review') {
     setView(next);
     setSelection(null);
     setDiff(null);
+    setFindingFocus(null);
   }
-  function selectHistory(commitHash: string) {
+  function locateCode(location: CodeLocation) {
+    setFindingFocus(location);
+    if (reviewInfo?.latest)
+      setSelection({
+        scope: 'review',
+        path: location.path,
+        reviewId: reviewInfo.latest.id,
+        reviewScope,
+      });
+  }
+  function selectHistory(branch: Branch) {
     selectView('history');
-    setSelectedCommit(commitHash);
+    setHistoryRef(branch.ref);
+    setHistorySearch('');
+    setHistoryQuery('');
+    setSelectedCommit(branch.hash);
+  }
+  function changeReviewScope(scope: ReviewScope) {
+    if (scope === reviewScope) return;
+    setReviewScope(scope);
+    setReviewInfo(null);
+    setSelection(null);
+    setReviewView({ tab: 'changes', file: '' });
+  }
+
+  const diffFiles: { label: string; selection: DiffSelection }[] =
+    view === 'history' && commitDetails
+      ? commitDetails.files.map((file) => ({
+          label: '历史提交',
+          selection: { scope: 'commit', commit: commitDetails.commit.hash, path: file.path },
+        }))
+      : view === 'review' && reviewInfo?.latest
+        ? reviewInfo.latest.included.map((path) => ({
+            label: reviewScope === 'local' ? '本地快照' : '暂存快照',
+            selection: { scope: 'review', path, reviewId: reviewInfo.latest!.id, reviewScope },
+          }))
+        : [
+            ...unstaged.map((file) => ({
+              label: '未暂存',
+              selection: { scope: 'worktree' as const, path: file.path },
+            })),
+            ...staged.map((file) => ({
+              label: '已暂存',
+              selection: { scope: 'index' as const, path: file.path },
+            })),
+            ...untracked.map((file) => ({
+              label: '未跟踪',
+              selection: { scope: 'worktree' as const, path: file.path },
+            })),
+          ];
+  const diffFileIndex = diffFiles.findIndex(
+    (item) => item.selection.path === selection?.path && item.selection.scope === selection.scope,
+  );
+  function navigateDiff(next: DiffSelection) {
+    setFindingFocus(null);
+    setSelection(next);
+  }
+  function moveDiff(offset: number) {
+    const file = diffFiles[diffFileIndex + offset];
+    if (file) navigateDiff(file.selection);
   }
 
   function fileGroup(
@@ -454,58 +659,87 @@ export function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${api.customTitleBar ? ' desktop-shell' : ''}`}>
       <header className="topbar">
         <div className="brand">
           <GitBranch size={23} strokeWidth={2.2} />
           <span>CodeGuard</span>
-          <span className="version">0.1</span>
         </div>
-        <div className="repository-picker">
-          <FolderGit2 size={16} />
-          <select
-            aria-label="当前仓库"
-            value={activeId || ''}
-            disabled={!!busy || !workspace?.repositories.length}
-            onChange={(event) => void switchRepository(event.target.value)}
-          >
-            {!workspace?.repositories.length && <option value="">选择本地仓库</option>}
-            {workspace?.repositories.map((item) => (
-              <option value={item.id} key={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </div>
+        <RepositoryPicker
+          repositories={workspace?.repositories || []}
+          activeId={activeId}
+          disabled={!!busy}
+          onSelect={(id) => void switchRepository(id)}
+          onManageRemotes={() => setRemotesOpen(true)}
+        />
         {state && (
-          <span className="current-branch">
-            <GitBranch size={13} />
-            {state.detached ? `HEAD · ${state.head?.slice(0, 8)}` : state.branch}
-          </span>
+          <BranchMenu
+            state={state}
+            disabled={!!busy}
+            onOperation={setGitOperation}
+            onHistory={selectHistory}
+          />
         )}
+        <div className="titlebar-drag-region" aria-hidden="true" />
         <div className="toolbar">
-          <span className={`local-label ${api.mode === 'fixture' ? 'fixture-label' : ''}`}>
-            {api.mode === 'fixture' ? '临时仓库 · 开发预览' : '本地 Git 工作台'}
-          </span>
+          {api.mode === 'fixture' && <span className="local-label fixture-label">临时仓库</span>}
           <button
             className="toolbar-button"
             disabled={!!busy || !activeId || loading}
             onClick={() => activeId && void refresh(activeId)}
+            title="刷新本地状态"
+            aria-label="刷新"
           >
             <RefreshCw size={14} className={loading ? 'spin' : ''} />
-            刷新
+            <span className="toolbar-extra-label">刷新</span>
           </button>
+          <div className="sync-toolbar" aria-label="远端同步">
+            <button
+              className="toolbar-button"
+              disabled={!!busy || !state}
+              onClick={() => setGitOperation({ kind: 'fetch' })}
+              title="获取远端状态"
+            >
+              <RefreshCw size={14} />
+              获取
+            </button>
+            <button
+              className="toolbar-button"
+              disabled={!!busy || !state}
+              onClick={() => setGitOperation({ kind: 'pull' })}
+              title="拉取（仅快进）"
+            >
+              <ArrowDown size={14} />
+              拉取{!!state?.behind && <small>{state.behind}</small>}
+            </button>
+            <button
+              className="toolbar-button"
+              disabled={!!busy || !state}
+              onClick={() => setGitOperation({ kind: 'push' })}
+              title="预览并推送"
+            >
+              <ArrowUp size={14} />
+              推送{!!state?.ahead && <small>{state.ahead}</small>}
+            </button>
+          </div>
           <button
             className="toolbar-button"
             disabled={!!busy}
             onClick={() => void pickRepository()}
+            title="打开仓库"
+            aria-label="打开仓库"
           >
             <FolderOpen size={15} />
-            打开仓库
+            <span className="toolbar-extra-label">打开仓库</span>
           </button>
-          <button className="toolbar-button" onClick={() => setSettingsOpen(true)}>
+          <button
+            className="toolbar-button"
+            aria-label="模型设置"
+            title="模型设置"
+            onClick={() => setSettingsOpen(true)}
+          >
             <Settings2 size={15} />
-            模型设置
+            <span className="toolbar-extra-label">模型设置</span>
           </button>
         </div>
       </header>
@@ -513,56 +747,41 @@ export function App() {
       <div className="body-layout">
         <aside className="sidebar">
           <div className="sidebar-section">
-            <div className="section-caption">工作区</div>
-            <button
-              className={`nav-item ${view === 'changes' ? 'active' : ''}`}
-              onClick={() => selectView('changes')}
-            >
-              <Files size={15} />
-              <span>当前改动</span>
-              <span className="nav-count">{state?.files.length || 0}</span>
-            </button>
-            <button
-              className={`nav-item ${view === 'history' ? 'active' : ''}`}
-              onClick={() => selectView('history')}
-            >
-              <History size={15} />
-              <span>提交历史</span>
-            </button>
-          </div>
-          <div className="sidebar-section">
-            <div className="section-caption">
-              本地分支 <span>浏览</span>
-            </div>
+            <div className="section-caption">浏览本地分支</div>
+            <p className="sidebar-hint">点击浏览历史；切换请用顶部菜单</p>
             {state?.branches
               .filter((branch) => !branch.remote)
               .map((branch) => (
                 <button
                   key={branch.name}
                   className={`branch-item ${branch.current ? 'current' : ''}`}
-                  onClick={() => selectHistory(branch.hash)}
-                  title={branch.name}
+                  onClick={() => selectHistory(branch)}
+                  title={`浏览 ${branch.name} 历史，不切换工作分支`}
+                  aria-label={`浏览 ${branch.name} 历史`}
+                  aria-pressed={historyRef === branch.ref}
                 >
                   <span className={`branch-dot ${branch.current ? 'purple' : 'green'}`} />
                   <span>{branch.name}</span>
-                  {branch.current && <Check size={12} />}
+                  {branch.current && <span className="branch-current-tag">已检出</span>}
                 </button>
               ))}
             {state && !state.branches.some((branch) => !branch.remote) && (
               <p className="sidebar-hint">首个提交后显示分支</p>
             )}
           </div>
-          {!!state?.branches.some((branch) => branch.remote) && (
+          {!!state?.branches.some((branch) => branch.remote && !branch.symbolic) && (
             <div className="sidebar-section">
-              <div className="section-caption">远端分支</div>
+              <div className="section-caption">浏览远端分支</div>
               {state.branches
-                .filter((branch) => branch.remote)
+                .filter((branch) => branch.remote && !branch.symbolic)
                 .map((branch) => (
                   <button
                     key={branch.name}
                     className="branch-item"
-                    onClick={() => selectHistory(branch.hash)}
-                    title={branch.name}
+                    onClick={() => selectHistory(branch)}
+                    title={`浏览 ${branch.name} 历史，不切换工作分支`}
+                    aria-label={`浏览 ${branch.name} 历史`}
+                    aria-pressed={historyRef === branch.ref}
                   >
                     <span className="branch-dot blue" />
                     <span>{branch.name}</span>
@@ -573,9 +792,14 @@ export function App() {
           <div className="sidebar-bottom">
             {repository && (
               <>
-                <p className="repository-root" title={repository.root}>
-                  {repository.root}
-                </p>
+                <button
+                  className="nav-item manage-remotes-button"
+                  disabled={!!busy}
+                  onClick={() => setRemotesOpen(true)}
+                >
+                  <Globe size={15} />
+                  管理远程仓库
+                </button>
                 <button
                   className="remove-repo"
                   disabled={!!busy}
@@ -587,10 +811,6 @@ export function App() {
                 </button>
               </>
             )}
-            <div className="phase-note">
-              <span className="phase-dot" />
-              Git 工作台 · AI 评审
-            </div>
           </div>
         </aside>
 
@@ -610,9 +830,13 @@ export function App() {
               <GitCommitHorizontal size={15} />
               提交历史
             </button>
-            <span className="tab-right">
-              {view === 'history' ? '最近 150 条 · 所有本地引用' : '全部本地改动'}
-            </span>
+            <button
+              className={view === 'review' ? 'active' : ''}
+              onClick={() => selectView('review')}
+            >
+              <Sparkles size={14} />
+              可视化审查
+            </button>
           </nav>
           {notice && (
             <div
@@ -639,7 +863,6 @@ export function App() {
               <div className="welcome-icon">
                 <FolderGit2 size={38} />
               </div>
-              <span className="eyebrow">YOUR CHANGES, IN FOCUS</span>
               <h1>从一个本地仓库开始</h1>
               <p>看清改动，选择提交内容，沿着分支查看历史。</p>
               <button className="primary" disabled={!!busy} onClick={() => void pickRepository()}>
@@ -659,56 +882,145 @@ export function App() {
               <div className="diff-toolbar">
                 <button className="back-button" onClick={() => setSelection(null)}>
                   <ArrowLeft size={14} />
-                  {view === 'history' ? '返回历史' : '返回概览'}
+                  {view === 'history' ? '返回历史' : view === 'review' ? '返回审查' : '返回概览'}
                 </button>
                 <span className={`scope-chip ${selection.scope === 'index' ? 'mint' : ''}`}>
                   {selection.scope === 'index'
                     ? '已暂存 · 本次提交'
-                    : selection.scope === 'commit'
-                      ? `提交 ${selection.commit?.slice(0, 8)}`
-                      : '未暂存 · 工作区'}
+                    : selection.scope === 'review'
+                      ? `${selection.reviewScope === 'local' ? '全部本地改动' : '本次提交'} · 固定快照`
+                      : selection.scope === 'commit'
+                        ? `提交 ${selection.commit?.slice(0, 8)}`
+                        : '未暂存 · 工作区'}
                 </span>
+                {(selection.scope === 'index' || selection.scope === 'worktree') &&
+                  selectedFile && (
+                    <div className="diff-staging-actions">
+                      <button
+                        className="secondary"
+                        disabled={!!busy || state.locked}
+                        onClick={() =>
+                          void changeStaging(
+                            selectedFile,
+                            selection.scope === 'index' ? 'unstage' : 'stage',
+                          )
+                        }
+                      >
+                        {selection.scope === 'index' ? <Minus size={14} /> : <Plus size={14} />}
+                        {selection.scope === 'index' ? '取消暂存' : '暂存此文件'}
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={!canStageAll}
+                        aria-label="暂存全部"
+                        onClick={() => void stageAll()}
+                      >
+                        <Plus size={14} />
+                        {busy === '暂存全部' ? '正在暂存…' : '暂存全部'}
+                      </button>
+                    </div>
+                  )}
               </div>
-              <div className="diff-title">
-                <FileDiff size={17} />
-                <h2 title={selection.path}>{selection.path}</h2>
+              <div className="diff-navigation-toolbar">
+                <button
+                  className="secondary"
+                  aria-label="切换差异文件列表"
+                  aria-pressed={diffFilesOpen}
+                  onClick={() => setDiffFilesOpen(!diffFilesOpen)}
+                >
+                  {diffFilesOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
+                  文件列表
+                </button>
+                <span>
+                  {diffFileIndex >= 0 ? `${diffFileIndex + 1} / ${diffFiles.length}` : '固定版本'}
+                </span>
+                <button
+                  className="secondary"
+                  aria-label="上一文件"
+                  disabled={diffFileIndex <= 0}
+                  onClick={() => moveDiff(-1)}
+                >
+                  <ArrowLeft size={14} />
+                  上一文件
+                </button>
+                <button
+                  className="secondary"
+                  aria-label="下一文件"
+                  disabled={diffFileIndex < 0 || diffFileIndex >= diffFiles.length - 1}
+                  onClick={() => moveDiff(1)}
+                >
+                  下一文件
+                  <ArrowRight size={14} />
+                </button>
               </div>
-              <DiffView
-                diff={diff}
-                loading={diffLoading}
-                focus={
-                  selection?.scope === 'index' &&
-                  findingFocus &&
-                  (selection.path === findingFocus.path ||
-                    state?.files.some(
-                      (file) =>
-                        file.path === selection.path && file.previousPath === findingFocus.path,
-                    ))
-                    ? findingFocus
-                    : null
-                }
-              />
+              <div className="diff-browser">
+                {diffFilesOpen && (
+                  <nav className="diff-file-nav" aria-label="差异文件">
+                    {diffFiles.map((item, index) => (
+                      <button
+                        key={`${item.selection.scope}:${item.selection.path}`}
+                        className={index === diffFileIndex ? 'selected' : ''}
+                        aria-current={index === diffFileIndex ? 'true' : undefined}
+                        title={`${item.label} · ${item.selection.path}`}
+                        onClick={() => navigateDiff(item.selection)}
+                      >
+                        <span>{item.selection.path}</span>
+                        <small>{item.label}</small>
+                      </button>
+                    ))}
+                  </nav>
+                )}
+                <div className="diff-document">
+                  <div className="diff-title">
+                    <FileDiff size={17} />
+                    <h2 title={selection.path}>{selection.path}</h2>
+                  </div>
+                  <DiffView
+                    diff={diff}
+                    loading={diffLoading}
+                    focus={
+                      (selection?.scope === 'index' || selection?.scope === 'review') &&
+                      findingFocus &&
+                      (selection.path === findingFocus.path ||
+                        state?.files.some(
+                          (file) =>
+                            file.path === selection.path && file.previousPath === findingFocus.path,
+                        ))
+                        ? findingFocus
+                        : null
+                    }
+                  />
+                </div>
+              </div>
             </section>
+          ) : view === 'review' ? (
+            <ReviewWorkspace
+              key={activeId}
+              review={reviewInfo}
+              state={reviewView}
+              onViewChange={setReviewView}
+              onLocate={locateCode}
+              onFile={(path) => {
+                setFindingFocus(null);
+                if (reviewInfo?.latest)
+                  setSelection({
+                    scope: 'review',
+                    path,
+                    reviewId: reviewInfo.latest.id,
+                    reviewScope,
+                  });
+              }}
+            />
           ) : view === 'changes' ? (
-            <section className="changes-panel">
-              <div className="page-heading">
-                <div>
-                  <span className="eyebrow">WORKING DIRECTORY</span>
-                  <h1>
-                    {state.files.length ? '把改动整理成一次清楚的提交' : '工作区干净，一切就绪'}
-                  </h1>
-                  <p>
-                    {state.files.length
-                      ? '先查看全部改动，再选择本次提交内容。'
-                      : state.head
-                        ? '可以切换到提交历史，查看已有改动。'
-                        : '这是一个空仓库，添加文件后即可创建首个提交。'}
-                  </p>
-                </div>
-                <div className={`state-orb ${state.files.length ? 'changed' : ''}`}>
-                  {state.files.length ? <Files size={25} /> : <Check size={26} />}
-                </div>
-              </div>
+            <section
+              className="changes-panel"
+              ref={(element) => {
+                if (element) element.scrollTop = overviewScroll.current.changes || 0;
+              }}
+              onScroll={(event) => {
+                overviewScroll.current.changes = event.currentTarget.scrollTop;
+              }}
+            >
               {(state.operation || state.locked || conflicts > 0) && (
                 <div className="inline-warning">
                   <AlertTriangle size={15} />
@@ -716,60 +1028,133 @@ export function App() {
                   {state.operation ? `仓库正在进行 ${state.operation}。` : ''}
                   {conflicts > 0 ? ` ${conflicts} 个文件存在冲突。` : ''}
                   请在外部处理后刷新，工具保留当前状态。
+                  {state.operation === 'merge' && (
+                    <>
+                      <button
+                        className="secondary"
+                        disabled={!!busy || !!conflicts}
+                        onClick={() => setGitOperation({ kind: 'continueMerge' })}
+                      >
+                        继续合并…
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={!!busy}
+                        onClick={() => setGitOperation({ kind: 'abortMerge' })}
+                      >
+                        中止合并…
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
-              <div className="summary-cards">
-                <div>
-                  <span>本地改动</span>
-                  <strong>
-                    {state.files.length}
-                    <small>个文件</small>
-                  </strong>
-                </div>
-                <div className="staged-card">
-                  <span>本次提交</span>
-                  <strong>
-                    {staged.length}
-                    <small>个文件</small>
-                  </strong>
-                </div>
-                <div>
-                  <span>未跟踪</span>
-                  <strong>
-                    {untracked.length}
-                    <small>个文件</small>
-                  </strong>
-                </div>
-              </div>
               <div className="list-heading">
-                <h2>改动文件</h2>
-                <span>同一文件可以同时有暂存和未暂存内容</span>
+                <button
+                  className="secondary stage-all-button"
+                  aria-label="暂存全部"
+                  title={
+                    conflicts
+                      ? '请先处理冲突文件'
+                      : state.locked
+                        ? 'Git 索引正在被占用'
+                        : '暂存全部修改、新增和删除，遵循 Git 忽略规则'
+                  }
+                  disabled={!canStageAll}
+                  onClick={() => void stageAll()}
+                >
+                  {busy === '暂存全部' ? (
+                    <LoaderCircle size={14} className="spin" />
+                  ) : (
+                    <Plus size={14} />
+                  )}
+                  {busy === '暂存全部' ? '正在暂存…' : '暂存全部'}
+                </button>
               </div>
-              {fileGroup('未暂存', unstaged, 'worktree', 'unstaged')}
-              {fileGroup('已暂存', staged, 'index', 'staged')}
-              {fileGroup('未跟踪', untracked, 'worktree', 'untracked')}
-              <div className="quiet-note">
-                <Circle size={6} fill="currentColor" />
-                点击文件查看差异；右侧 ＋ / − 只改变暂存状态。
-              </div>
+              {unstaged.length > 0 && fileGroup('未暂存', unstaged, 'worktree', 'unstaged')}
+              {staged.length > 0 && fileGroup('已暂存', staged, 'index', 'staged')}
+              {untracked.length > 0 && fileGroup('未跟踪', untracked, 'worktree', 'untracked')}
+              {!state.files.length && (
+                <p className="changes-empty" role="status">
+                  <Check size={16} />
+                  {state.head ? '没有本地改动' : '暂无文件，添加文件后刷新'}
+                </p>
+              )}
             </section>
           ) : (
             <section className="history-panel">
-              <div className="history-heading">
-                <div>
-                  <span className="eyebrow">COMMIT HISTORY</span>
-                  <h1>沿着分支，查看每一次变化</h1>
+              <div className="history-heading history-controls">
+                <div className="history-scope">
+                  <span>
+                    正在浏览：
+                    {state.branches.find((branch) => branch.ref === historyRef)?.name ||
+                      (historyRef ? '已失效分支' : '全部分支')}
+                  </span>
+                  {historyRef && (
+                    <button className="text-button" onClick={() => setHistoryRef('')}>
+                      全部历史
+                    </button>
+                  )}
                 </div>
-                <span className="history-total">{history.length} 个提交</span>
+                <label className="history-search">
+                  <Search size={14} />
+                  <input
+                    type="search"
+                    aria-label="搜索提交历史"
+                    placeholder="搜索说明、作者或哈希"
+                    value={historySearch}
+                    maxLength={200}
+                    onChange={(event) => setHistorySearch(event.target.value)}
+                  />
+                </label>
+                <span className="history-total">
+                  {historyLoading
+                    ? '正在查找…'
+                    : `已加载 ${history.length} 条${historyHasMore ? ' · 还有更多' : historyQuery ? ' · 全部匹配结果' : ' · 当前范围已全部加载'}`}
+                </span>
               </div>
+              {historyError && (
+                <p className="review-error history-error" role="alert">
+                  {historyError}
+                  <button
+                    className="text-button"
+                    onClick={() =>
+                      history.length
+                        ? void loadMoreHistory()
+                        : setHistoryVersion((value) => value + 1)
+                    }
+                  >
+                    重试
+                  </button>
+                </p>
+              )}
               {!history.length ? (
                 <div className="center-message">
                   <GitCommitHorizontal size={30} />
-                  <h3>还没有提交</h3>
-                  <p>在当前改动中暂存文件，创建首个提交。</p>
+                  <h3>
+                    {historyLoading
+                      ? '正在读取历史…'
+                      : historyError
+                        ? '历史尚未加载'
+                        : historyQuery
+                          ? '没有匹配的提交'
+                          : '当前范围没有提交'}
+                  </h3>
+                  <p>
+                    {historyQuery
+                      ? '搜索涵盖当前分支范围的全部历史，可修改关键词或返回全部历史。'
+                      : '可选择其他分支，或在当前改动中创建首个提交。'}
+                  </p>
                 </div>
               ) : (
-                <div className="history-scroll">
+                <div
+                  className="history-scroll"
+                  ref={(element) => {
+                    if (element) element.scrollTop = overviewScroll.current.history || 0;
+                  }}
+                  onScroll={(event) => {
+                    overviewScroll.current.history = event.currentTarget.scrollTop;
+                  }}
+                >
                   <div
                     className="history-table"
                     style={{ '--graph-width': `${graph.width}px` } as React.CSSProperties}
@@ -854,85 +1239,83 @@ export function App() {
                       );
                     })}
                   </div>
+                  {historyHasMore && (
+                    <button
+                      className="secondary history-load-more"
+                      disabled={historyLoading}
+                      onClick={() => void loadMoreHistory()}
+                    >
+                      {historyLoading ? '加载中…' : '继续加载更早提交'}
+                    </button>
+                  )}
                 </div>
               )}
               <div className="history-hint">
                 <GitBranch size={13} />
-                浏览提交不会切换分支或修改工作区。
+                {historyQuery
+                  ? '搜索结果省略未匹配提交；浏览不会切换分支。'
+                  : '浏览提交不会切换分支或修改工作区。'}
               </div>
             </section>
           )}
         </main>
 
         <aside className="detail-panel">
-          {view === 'changes' ? (
+          {view !== 'history' ? (
             <>
-              <div className="detail-heading">
-                <GitCommitHorizontal size={17} />
-                <h2>本次提交</h2>
-                <span className="count">{staged.length}</span>
-              </div>
-              <div className="target-box">
-                <span>提交到当前分支</span>
-                <strong>
-                  <GitBranch size={13} />
-                  {state?.detached
-                    ? `游离 HEAD · ${state.head?.slice(0, 8)}`
-                    : state?.branch || '尚未选择仓库'}
-                </strong>
-              </div>
-              <div className="composition">
-                <label htmlFor="commit-message">提交说明</label>
-                <textarea
-                  id="commit-message"
-                  value={draft}
-                  onChange={(event) => saveDraft(event.target.value)}
-                  disabled={!activeId || !!busy}
-                  placeholder={'简短说明这次改动\n\n必要时补充原因和验证说明。'}
-                  spellCheck={false}
-                />
-                <div className="draft-caption">
-                  <span>{draft ? '草稿保存在本地' : '说明由你填写'}</span>
-                  <span>{draft.length} 字</span>
-                </div>
-              </div>
-              <div className="commit-selection-summary">
-                <span>
-                  已暂存 <b>{staged.length}</b> 个文件
-                </span>
-                {unstaged.length > 0 && <small>未暂存的编辑不会进入提交</small>}
-              </div>
-              <button
-                className="primary preview-button"
-                ref={previewButton}
-                disabled={!state || !!busy || !staged.length || !!state.operation || !!conflicts}
-                onClick={() => void prepareCommit()}
-              >
-                {busy === '准备提交' ? (
-                  <LoaderCircle size={16} className="spin" />
-                ) : (
-                  <GitCommitHorizontal size={16} />
-                )}
-                预览提交
-                <ChevronRight size={15} />
-              </button>
-              <p className="hook-note">
-                提交遵循仓库现有的钩子与签名设置。失败时保留草稿，并显示 Git 的真实错误。
-              </p>
+              {view === 'changes' ? (
+                <>
+                  <CommitMessageComposer
+                    key={`commit-message:${activeId}`}
+                    repositoryId={activeId}
+                    indexRevision={state?.indexRevision}
+                    stagedCount={staged.length}
+                    disabled={!!busy || !!conflicts || !!state?.operation}
+                    draft={draft}
+                    onChange={saveDraft}
+                    onSettings={() => setSettingsOpen(true)}
+                  />
+                  <div className="commit-selection-summary">
+                    <span>
+                      仅提交已暂存的 <b>{staged.length}</b> 个文件
+                    </span>
+                  </div>
+                  <button
+                    className="primary preview-button"
+                    ref={previewButton}
+                    disabled={
+                      !state || !!busy || !staged.length || !!state.operation || !!conflicts
+                    }
+                    onClick={() => void prepareCommit()}
+                  >
+                    {busy === '准备提交' ? (
+                      <LoaderCircle size={16} className="spin" />
+                    ) : (
+                      <GitCommitHorizontal size={16} />
+                    )}
+                    预览提交
+                    <ChevronRight size={15} />
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button className="secondary" onClick={() => selectView('changes')}>
+                    <ArrowLeft size={14} />
+                    返回提交准备
+                  </button>
+                </>
+              )}
               {state && (
                 <ReviewPanel
                   key={state.repositoryId}
                   repository={state}
                   settingsVersion={settingsVersion}
+                  scope={reviewScope}
+                  onScope={changeReviewScope}
                   onSettings={() => setSettingsOpen(true)}
                   onState={setReviewInfo}
-                  onLocate={(finding) => {
-                    setFindingFocus(finding);
-                    const file = state.files.find(
-                      (item) => item.path === finding.path || item.previousPath === finding.path,
-                    );
-                    setSelection({ scope: 'index', path: file?.path || finding.path });
-                  }}
+                  workspaceOpen={view === 'review'}
+                  onOpen={() => selectView('review')}
                 />
               )}
             </>
@@ -1005,51 +1388,20 @@ export function App() {
               )}
             </>
           )}
-          {state && (
-            <div className="repository-status">
-              <div className="section-caption">仓库状态</div>
-              <div>
-                <span>当前分支</span>
-                <b>{state.detached ? '游离 HEAD' : state.branch}</b>
-              </div>
-              <div>
-                <span>上游</span>
-                <b>{state.upstream || '未设置'}</b>
-              </div>
-              <div>
-                <span>领先 / 落后</span>
-                <b>
-                  <ArrowUp size={11} />
-                  {state.ahead}
-                  <ArrowDown size={11} />
-                  {state.behind}
-                </b>
-              </div>
-            </div>
-          )}
         </aside>
       </div>
 
-      <footer className="statusbar">
+      <footer
+        className="statusbar"
+        title={
+          updatedAt
+            ? `刷新于 ${updatedAt.toLocaleTimeString('zh-CN', { hour12: false })}`
+            : undefined
+        }
+      >
         <span>
           <span className={`live-dot ${busy ? 'amber' : ''}`} />
           {busy || (repository ? (state ? '已连接本地 Git' : '等待仓库状态') : '等待打开仓库')}
-        </span>
-        {state && (
-          <span>
-            <GitBranch size={12} />
-            {state.detached ? 'HEAD detached' : state.branch}
-          </span>
-        )}
-        {state && (
-          <span>
-            {staged.length} 个已暂存 · {state.files.length} 个改动文件
-          </span>
-        )}
-        <span className="status-right">
-          {updatedAt && `刷新于 ${updatedAt.toLocaleTimeString('zh-CN', { hour12: false })}`}
-          <span className="status-divider" />
-          本地操作 · 不自动推送
         </span>
       </footer>
 
@@ -1057,6 +1409,53 @@ export function App() {
         <ModelSettingsDialog
           onClose={() => setSettingsOpen(false)}
           onSaved={() => setSettingsVersion((value) => value + 1)}
+        />
+      )}
+      {remotesOpen && activeId && (
+        <RemoteSettingsDialog
+          key={`remotes:${activeId}`}
+          repositoryId={activeId}
+          repositoryName={repository?.name || ''}
+          onClose={() => {
+            setRemotesOpen(false);
+            setRemoteReturn(null);
+          }}
+          continueLabel={remoteReturn ? `继续${operationLabels[remoteReturn.kind]}` : undefined}
+          onContinue={
+            remoteReturn
+              ? () => {
+                  setRemotesOpen(false);
+                  setGitOperation(remoteReturn);
+                  setRemoteReturn(null);
+                }
+              : undefined
+          }
+          onChanged={() => void refresh(activeId, true)}
+          onBusy={(value) => setBusy(value ? '更新远程仓库' : null)}
+        />
+      )}
+      {gitOperation && activeId && (
+        <GitOperationDialog
+          repositoryId={activeId}
+          initial={gitOperation}
+          onClose={() => setGitOperation(null)}
+          onBusy={(running) => setBusy(running ? operationLabels[gitOperation.kind] : null)}
+          onManageRemotes={() => {
+            setRemoteReturn(gitOperation);
+            setGitOperation(null);
+            setRemotesOpen(true);
+          }}
+          onFinished={(message, warning, nextState) => {
+            if (nextState) {
+              setState(nextState);
+              setUpdatedAt(new Date());
+            }
+            if (message) {
+              setSelection(null);
+              setNotice({ kind: warning ? 'warning' : 'success', message: warning || message });
+            }
+            void refresh(activeId, true);
+          }}
         />
       )}
       {previewOpen && (
@@ -1091,7 +1490,6 @@ export function App() {
           >
             <div className="dialog-heading">
               <div>
-                <span className="eyebrow">COMMIT PREVIEW</span>
                 <h2 id="preview-title">确认这一次提交</h2>
               </div>
               <button
@@ -1110,13 +1508,14 @@ export function App() {
             <p className="dialog-subtitle">只提交下列暂存内容。此按钮完成提交，不会推送。</p>
             <p className="review-advisory">
               AI 评审：
-              {reviewInfo?.running
+              {commitReviewInfo?.running && commitReviewInfo.runningScope === 'staged'
                 ? '正在进行'
-                : !reviewInfo?.latest
+                : !commitReviewInfo?.latest
                   ? '尚未评审'
-                  : reviewInfo.latest.stale || (preview && reviewInfo.latest.tree !== preview.tree)
+                  : commitReviewInfo.latest.stale ||
+                      (preview && commitReviewInfo.latest.tree !== preview.tree)
                     ? '基于旧版本'
-                    : `${reviewInfo.latest.findings.length} 个待人工核对的问题${reviewInfo.latest.skipped.length || reviewInfo.latest.unverifiedCount ? ' · 部分覆盖' : ''}`}
+                    : `${commitReviewInfo.latest.findings.length} 个待人工核对的问题${commitReviewInfo.latest.skipped.length || commitReviewInfo.latest.unverifiedCount ? ' · 部分覆盖' : ''}`}
               。仅供参考，可以继续提交。
             </p>
             {preview ? (
