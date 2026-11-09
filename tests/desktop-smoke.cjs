@@ -81,6 +81,87 @@ app
       }, 25);
       const deadline = setTimeout(() => { clearInterval(timer); reject(new Error('Repository UI did not load')); }, 5000);
     })`);
+    const waitForChangesUI = (condition) =>
+      window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+        const timer = setInterval(() => { if (${condition}) { clearInterval(timer); clearTimeout(deadline); resolve(true); } }, 25);
+        const deadline = setTimeout(() => { clearInterval(timer); reject(new Error('Changed files UI did not settle')); }, 5000);
+      })`);
+    await waitForChangesUI("document.querySelectorAll('.sidebar .file-select').length === 2");
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "!!document.querySelector('.sidebar .branch-item, .sidebar .sidebar-section, .main-panel .change-group')",
+      ),
+      false,
+    );
+    // Both versions of the same file live in the sidebar; clicking one selects its real diff.
+    await window.webContents.executeJavaScript(
+      "document.querySelectorAll('.sidebar .file-select')[1].click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.diff-lines')?.textContent.includes('staged version') && document.querySelector('.scope-chip')?.textContent.includes('已暂存')",
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript("!!document.querySelector('.diff-file-nav')"),
+      false,
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelectorAll('.sidebar .file-select[aria-current=true]').length",
+      ),
+      1,
+    );
+    assert.doesNotMatch(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.diff-lines').textContent",
+      ),
+      /worktree version/,
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.sidebar .group-heading').click()",
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelectorAll('.sidebar .file-select').length",
+      ),
+      1,
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.sidebar .group-heading').click(); [...document.querySelectorAll('.view-tabs button')].find(b=>b.textContent.includes('提交历史')).click()",
+    );
+    await waitForChangesUI("document.querySelector('.history-panel')");
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.sidebar .file-select').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.diff-lines')?.textContent.includes('worktree version') && document.querySelector('.scope-chip')?.textContent.includes('未暂存')",
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.view-tabs .active').textContent.startsWith('当前改动')",
+      ),
+      true,
+    );
+    if (process.env.CODEGUARD_SMOKE_SIDEBAR_DIR) {
+      for (const [width, height] of [
+        [1080, 700],
+        [1440, 950],
+      ]) {
+        window.setSize(width, height);
+        window.showInactive();
+        window.webContents.setBackgroundThrottling(false);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        window.webContents.invalidate();
+        fs.writeFileSync(
+          path.join(process.env.CODEGUARD_SMOKE_SIDEBAR_DIR, `sidebar-diff-${width}.png`),
+          (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+        );
+        window.hide();
+      }
+    }
+    await window.webContents.executeJavaScript("document.querySelector('.back-button').click()");
+    console.log(
+      'Changed files sidebar passed: grouped versions, collapse, selected diff, history-to-changes navigation, no duplicate list.',
+    );
     if (process.platform === 'win32') {
       const probe = async (width) => {
         const points = await window.webContents.executeJavaScript(`(() => {
@@ -625,6 +706,13 @@ app
           const selectors = ['.generate-commit-button', '.preview-button', '.review-actions .secondary', '.review-open-workspace'];
           return {
             height: panel.clientHeight, content: panel.scrollHeight,
+            changedFiles: (() => {
+              const sidebar = document.querySelector('.sidebar');
+              const list = document.querySelector('.sidebar-changes');
+              return { width: sidebar.getBoundingClientRect().width, overflow: getComputedStyle(list).overflowY,
+                horizontalOverflow: list.scrollWidth > list.clientWidth,
+                inSidebar: [...document.querySelectorAll('.file-select')].every(file => sidebar.contains(file)) };
+            })(),
             layout: [...panel.children, ...document.querySelector('.review-panel').children].map(item => ({
               name: item.className, height: item.getBoundingClientRect().height,
               top: getComputedStyle(item).marginTop, bottom: getComputedStyle(item).marginBottom,
@@ -644,6 +732,10 @@ app
           JSON.stringify({ width, height, compact }),
         );
         assert.ok(compact.width >= 330);
+        assert.ok(compact.changedFiles.width >= 240);
+        assert.equal(compact.changedFiles.overflow, 'auto');
+        assert.equal(compact.changedFiles.horizontalOverflow, false);
+        assert.equal(compact.changedFiles.inSidebar, true);
         assert.equal(compact.font, '14px');
         assert.equal(compact.clutter, false);
         assert.ok(
@@ -1078,6 +1170,21 @@ app
     await toolbarOperation('预览并推送');
     await previewAndExecute('推送');
     assert.equal((await runGit(remote, ['rev-parse', 'refs/heads/main'])).stdout.trim(), published);
+    await window.webContents.executeJavaScript("document.querySelector('.current-branch').click()");
+    await waitOperationUI("document.querySelector('.branch-menu')");
+    await window.webContents.executeJavaScript(
+      "[...document.querySelectorAll('.branch-menu .branch-name')].find(button => button.getAttribute('aria-label') === '浏览 feature/menu 历史').click()",
+    );
+    await waitOperationUI(
+      "document.querySelector('.history-scope')?.textContent.includes('feature/menu')",
+    );
+    assert.equal((await service.getState(repository.id)).branch, 'main');
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "!!document.querySelector('.sidebar .branch-item')",
+      ),
+      false,
+    );
     const branchAction = async (name, action) => {
       await window.webContents.executeJavaScript(
         "document.querySelector('.current-branch').click()",

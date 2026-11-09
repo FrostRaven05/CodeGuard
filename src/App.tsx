@@ -618,7 +618,11 @@ export function App() {
                 >
                   <button
                     className="file-select"
-                    onClick={() => setSelection({ scope, path: file.path })}
+                    aria-current={selected ? 'true' : undefined}
+                    onClick={() => {
+                      selectView('changes');
+                      setSelection({ scope, path: file.path });
+                    }}
                     title={file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}
                   >
                     <span className={`file-status status-${code}`}>{code}</span>
@@ -745,50 +749,60 @@ export function App() {
       </header>
 
       <div className="body-layout">
-        <aside className="sidebar">
-          <div className="sidebar-section">
-            <div className="section-caption">浏览本地分支</div>
-            <p className="sidebar-hint">点击浏览历史；切换请用顶部菜单</p>
-            {state?.branches
-              .filter((branch) => !branch.remote)
-              .map((branch) => (
-                <button
-                  key={branch.name}
-                  className={`branch-item ${branch.current ? 'current' : ''}`}
-                  onClick={() => selectHistory(branch)}
-                  title={`浏览 ${branch.name} 历史，不切换工作分支`}
-                  aria-label={`浏览 ${branch.name} 历史`}
-                  aria-pressed={historyRef === branch.ref}
-                >
-                  <span className={`branch-dot ${branch.current ? 'purple' : 'green'}`} />
-                  <span>{branch.name}</span>
-                  {branch.current && <span className="branch-current-tag">已检出</span>}
-                </button>
-              ))}
-            {state && !state.branches.some((branch) => !branch.remote) && (
-              <p className="sidebar-hint">首个提交后显示分支</p>
+        <aside className="sidebar" aria-label="当前改动文件">
+          <div className="sidebar-changes-heading">
+            <h2>当前改动{state && <span className="count">{state.files.length}</span>}</h2>
+            {state && (
+              <button
+                className="secondary stage-all-button"
+                aria-label="暂存全部"
+                title={
+                  conflicts
+                    ? '请先处理冲突文件'
+                    : state.locked
+                      ? 'Git 索引正在被占用'
+                      : '暂存全部修改、新增和删除，遵循 Git 忽略规则'
+                }
+                disabled={!canStageAll}
+                onClick={() => void stageAll()}
+              >
+                {busy === '暂存全部' ? (
+                  <LoaderCircle size={14} className="spin" />
+                ) : (
+                  <Plus size={14} />
+                )}
+                {busy === '暂存全部' ? '暂存中…' : '暂存全部'}
+              </button>
             )}
           </div>
-          {!!state?.branches.some((branch) => branch.remote && !branch.symbolic) && (
-            <div className="sidebar-section">
-              <div className="section-caption">浏览远端分支</div>
-              {state.branches
-                .filter((branch) => branch.remote && !branch.symbolic)
-                .map((branch) => (
-                  <button
-                    key={branch.name}
-                    className="branch-item"
-                    onClick={() => selectHistory(branch)}
-                    title={`浏览 ${branch.name} 历史，不切换工作分支`}
-                    aria-label={`浏览 ${branch.name} 历史`}
-                    aria-pressed={historyRef === branch.ref}
-                  >
-                    <span className="branch-dot blue" />
-                    <span>{branch.name}</span>
-                  </button>
-                ))}
-            </div>
-          )}
+          <div
+            className="sidebar-changes"
+            ref={(element) => {
+              if (element) element.scrollTop = overviewScroll.current.changes || 0;
+            }}
+            onScroll={(event) => {
+              overviewScroll.current.changes = event.currentTarget.scrollTop;
+            }}
+          >
+            {unstaged.length > 0 && fileGroup('未暂存', unstaged, 'worktree', 'unstaged')}
+            {staged.length > 0 && fileGroup('已暂存', staged, 'index', 'staged')}
+            {untracked.length > 0 && fileGroup('未跟踪', untracked, 'worktree', 'untracked')}
+            {!state && (
+              <p className="sidebar-empty">
+                {repository
+                  ? loading
+                    ? '正在读取改动…'
+                    : '无法读取改动，请刷新'
+                  : '打开仓库后查看改动'}
+              </p>
+            )}
+            {state && !state.files.length && (
+              <p className="sidebar-empty" role="status">
+                <Check size={15} />
+                {state.head ? '没有本地改动' : '暂无文件，添加文件后刷新'}
+              </p>
+            )}
+          </div>
           <div className="sidebar-bottom">
             {repository && (
               <>
@@ -882,7 +896,7 @@ export function App() {
               <div className="diff-toolbar">
                 <button className="back-button" onClick={() => setSelection(null)}>
                   <ArrowLeft size={14} />
-                  {view === 'history' ? '返回历史' : view === 'review' ? '返回审查' : '返回概览'}
+                  {view === 'history' ? '返回历史' : view === 'review' ? '返回审查' : '关闭差异'}
                 </button>
                 <span className={`scope-chip ${selection.scope === 'index' ? 'mint' : ''}`}>
                   {selection.scope === 'index'
@@ -922,15 +936,17 @@ export function App() {
                   )}
               </div>
               <div className="diff-navigation-toolbar">
-                <button
-                  className="secondary"
-                  aria-label="切换差异文件列表"
-                  aria-pressed={diffFilesOpen}
-                  onClick={() => setDiffFilesOpen(!diffFilesOpen)}
-                >
-                  {diffFilesOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
-                  文件列表
-                </button>
+                {(selection.scope === 'commit' || selection.scope === 'review') && (
+                  <button
+                    className="secondary"
+                    aria-label="切换差异文件列表"
+                    aria-pressed={diffFilesOpen}
+                    onClick={() => setDiffFilesOpen(!diffFilesOpen)}
+                  >
+                    {diffFilesOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
+                    文件列表
+                  </button>
+                )}
                 <span>
                   {diffFileIndex >= 0 ? `${diffFileIndex + 1} / ${diffFiles.length}` : '固定版本'}
                 </span>
@@ -954,22 +970,23 @@ export function App() {
                 </button>
               </div>
               <div className="diff-browser">
-                {diffFilesOpen && (
-                  <nav className="diff-file-nav" aria-label="差异文件">
-                    {diffFiles.map((item, index) => (
-                      <button
-                        key={`${item.selection.scope}:${item.selection.path}`}
-                        className={index === diffFileIndex ? 'selected' : ''}
-                        aria-current={index === diffFileIndex ? 'true' : undefined}
-                        title={`${item.label} · ${item.selection.path}`}
-                        onClick={() => navigateDiff(item.selection)}
-                      >
-                        <span>{item.selection.path}</span>
-                        <small>{item.label}</small>
-                      </button>
-                    ))}
-                  </nav>
-                )}
+                {diffFilesOpen &&
+                  (selection.scope === 'commit' || selection.scope === 'review') && (
+                    <nav className="diff-file-nav" aria-label="差异文件">
+                      {diffFiles.map((item, index) => (
+                        <button
+                          key={`${item.selection.scope}:${item.selection.path}`}
+                          className={index === diffFileIndex ? 'selected' : ''}
+                          aria-current={index === diffFileIndex ? 'true' : undefined}
+                          title={`${item.label} · ${item.selection.path}`}
+                          onClick={() => navigateDiff(item.selection)}
+                        >
+                          <span>{item.selection.path}</span>
+                          <small>{item.label}</small>
+                        </button>
+                      ))}
+                    </nav>
+                  )}
                 <div className="diff-document">
                   <div className="diff-title">
                     <FileDiff size={17} />
@@ -1012,15 +1029,7 @@ export function App() {
               }}
             />
           ) : view === 'changes' ? (
-            <section
-              className="changes-panel"
-              ref={(element) => {
-                if (element) element.scrollTop = overviewScroll.current.changes || 0;
-              }}
-              onScroll={(event) => {
-                overviewScroll.current.changes = event.currentTarget.scrollTop;
-              }}
-            >
+            <section className="changes-panel">
               {(state.operation || state.locked || conflicts > 0) && (
                 <div className="inline-warning">
                   <AlertTriangle size={15} />
@@ -1048,37 +1057,15 @@ export function App() {
                   )}
                 </div>
               )}
-              <div className="list-heading">
-                <button
-                  className="secondary stage-all-button"
-                  aria-label="暂存全部"
-                  title={
-                    conflicts
-                      ? '请先处理冲突文件'
-                      : state.locked
-                        ? 'Git 索引正在被占用'
-                        : '暂存全部修改、新增和删除，遵循 Git 忽略规则'
-                  }
-                  disabled={!canStageAll}
-                  onClick={() => void stageAll()}
-                >
-                  {busy === '暂存全部' ? (
-                    <LoaderCircle size={14} className="spin" />
-                  ) : (
-                    <Plus size={14} />
-                  )}
-                  {busy === '暂存全部' ? '正在暂存…' : '暂存全部'}
-                </button>
-              </div>
-              {unstaged.length > 0 && fileGroup('未暂存', unstaged, 'worktree', 'unstaged')}
-              {staged.length > 0 && fileGroup('已暂存', staged, 'index', 'staged')}
-              {untracked.length > 0 && fileGroup('未跟踪', untracked, 'worktree', 'untracked')}
-              {!state.files.length && (
-                <p className="changes-empty" role="status">
-                  <Check size={16} />
-                  {state.head ? '没有本地改动' : '暂无文件，添加文件后刷新'}
+              <div className="changes-selection-prompt">
+                <FileDiff size={28} />
+                <h2>{state.files.length ? '选择左侧文件查看差异' : '没有本地改动'}</h2>
+                <p>
+                  {state.files.length
+                    ? '未暂存与已暂存版本分别查看。'
+                    : '修改文件后，改动会显示在左侧。'}
                 </p>
-              )}
+              </div>
             </section>
           ) : (
             <section className="history-panel">
