@@ -104,12 +104,3 @@ node scripts/desktop-smoke.mjs --commit-message
 `node scripts/validate-model.mjs --inspect` 默认不联网。配置真实服务后，显式加上 `--run` 才会调用最多四组合成样例。已完成的 DeepSeek 样例只说明那一组小样本，不能代表真实仓库的总体质量。流程见 [真实模型验证](docs/model-validation.md)。
 
 `npm run preview:fixture` 在浏览器中打开一个只连接临时仓库的开发预览。`node scripts/preview.mjs --mock-model` 再连接本机模拟模型，用来查看评审交互。模拟结果不代表真实缺陷。
-
-## 设计记录
-
-- [产品方案](docs/product-plan.md)
-- [架构决定](docs/adr/0001-local-electron-workbench.md)
-- [领域术语](CONTEXT.md)
-- [Git 工作台任务](.scratch/git-workbench/README.md)
-- [AI 评审任务](.scratch/ai-review/README.md)
-- [同步与分支任务](.scratch/git-sync/README.md)

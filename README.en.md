@@ -104,12 +104,3 @@ Automated tests use temporary repositories and do not write to the development c
 `node scripts/validate-model.mjs --inspect` stays offline by default. After a real service is configured, `--run` calls at most four synthetic samples. The completed DeepSeek samples describe only that small set; they do not measure quality on a real repository. See [model validation](docs/model-validation.md).
 
 `npm run preview:fixture` opens a browser preview bound to a temporary repository. `node scripts/preview.mjs --mock-model` also connects a local mock model so the review interaction can be inspected. Mock findings are not real defects.
-
-## Design notes
-
-- [Product plan](docs/product-plan.md) (Chinese)
-- [Architecture decision](docs/adr/0001-local-electron-workbench.md) (Chinese)
-- [Domain language](CONTEXT.md) (Chinese)
-- [Git workbench notes](.scratch/git-workbench/README.md) (Chinese)
-- [AI review notes](.scratch/ai-review/README.md) (Chinese)
-- [Sync and branch notes](.scratch/git-sync/README.md) (Chinese)
