@@ -4,16 +4,20 @@
   "directories": {
     "output": "release"
   },
-  "files": ["dist/**/*", "electron/**/*.cjs", "package.json"],
+  "files": ["dist/**/*", "electron/**/*.cjs", "electron/assets/**/*", "package.json"],
   "asar": true,
   "npmRebuild": false,
   "win": {
+    "icon": "electron/assets/codeguard.ico",
     "target": [
       { "target": "nsis", "arch": ["x64"] },
       { "target": "portable", "arch": ["x64"] }
     ]
   },
   "nsis": {
+    "installerIcon": "electron/assets/codeguard.ico",
+    "uninstallerIcon": "electron/assets/codeguard.ico",
+    "installerHeaderIcon": "electron/assets/codeguard.ico",
     "artifactName": "${productName}-${version}-Setup-${arch}.${ext}",
     "oneClick": false,
     "perMachine": false,

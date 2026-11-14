@@ -18,6 +18,11 @@ async function createWorkbenchWindow(
     minWidth: 1080,
     minHeight: 700,
     title: 'CodeGuard',
+    icon: path.join(
+      __dirname,
+      'assets',
+      process.platform === 'win32' ? 'codeguard.ico' : 'codeguard.png',
+    ),
     ...(process.platform === 'win32'
       ? {
           titleBarStyle: 'hidden',
