@@ -172,7 +172,7 @@ class ModelSettings {
 async function callModel(
   connection,
   messages,
-  { signal, timeoutMs = 90000, fetchImpl = fetch, stream = false, onContent } = {},
+  { signal, timeoutMs = 90000, fetchImpl = fetch, stream = false, onContent, onReasoning } = {},
 ) {
   const timeout = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -210,7 +210,11 @@ async function callModel(
       response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
     ) {
       const { readCompletionStream } = require('./model-stream.cjs');
-      result = await readCompletionStream(reader, (content) => onContent?.(redact(content)));
+      result = await readCompletionStream(
+        reader,
+        (content) => onContent?.(redact(content)),
+        onReasoning,
+      );
     } else {
       const chunks = [];
       let size = 0;

@@ -74,6 +74,32 @@ test('流式请求兼容整包 JSON，缺失用量保持未知且密钥被隐藏
   assert.equal(result.totalTokens, null);
 });
 
+test('长思考流的协议开销不冒充正文过大，最终短结果可完成', async () => {
+  const reasoning = event({
+    id: 'fixture-completion',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model: 'fixture',
+    choices: [{ index: 0, delta: { reasoning_content: '隐藏' }, finish_reason: null }],
+  });
+  const wire =
+    reasoning.repeat(Math.ceil(2100000 / Buffer.byteLength(reasoning))) +
+    event(delta('完成')) +
+    event(stop()) +
+    'data: [DONE]\n\n';
+  const previews = [];
+  const reasoningActivity = [];
+  const result = await requestStream(wire, {
+    fetchImpl: async () => streamResponse(wire, 65536),
+    onContent: (text) => previews.push(text),
+    onReasoning: (...args) => reasoningActivity.push(args),
+  });
+  assert.equal(result.content, '完成');
+  assert.ok(previews.every((text) => !text.includes('隐藏')));
+  assert.ok(reasoningActivity.length > 0);
+  assert.ok(reasoningActivity.every((args) => args.length === 0));
+});
+
 test('断流、截断、错误事件和无效数据不冒充完成，服务错误原文不外泄', async (t) => {
   for (const [name, wire, code] of [
     ['missing-done', event(delta('partial')) + event(stop()), 'MODEL_INCOMPLETE'],
@@ -104,11 +130,28 @@ test('断流、截断、错误事件和无效数据不冒充完成，服务错�
 });
 
 test('SSE 响应超出字节上限会停止读取', async () => {
-  const wire = ': ' + 'x'.repeat(2000001) + '\n\n';
+  const wire = (': ' + 'x'.repeat(1000) + '\n\n').repeat(16000);
   await assert.rejects(
     requestStream(wire, { fetchImpl: async () => streamResponse(wire, 65536) }),
     { code: 'MODEL_OUTPUT_LIMIT' },
   );
+});
+
+test('SSE 正文仍受字节上限限制，单事件和未分隔事件保持有界', async (t) => {
+  const oversizedText = event(delta('文'.repeat(1000))).repeat(667);
+  for (const [name, wire] of [
+    ['content', oversizedText],
+    ['single-line', 'data: ' + 'x'.repeat(2000001)],
+    ['multi-line-event', ('data: ' + 'x'.repeat(1000) + '\n').repeat(2000)],
+  ])
+    await t.test(name, async () => {
+      await assert.rejects(
+        requestStream(wire, {
+          fetchImpl: async () => streamResponse(wire, 65536),
+        }),
+        { code: 'MODEL_OUTPUT_LIMIT' },
+      );
+    });
 });
 
 test('未完成 JSON 只提取完整的顶层摘要和问题，不混入嵌套字段、字符串片段', () => {

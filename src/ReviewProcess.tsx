@@ -38,7 +38,10 @@ export function ReviewProcess({ progress }: { progress: ReviewProgress }) {
         ? '已取消'
         : '评审未完成';
   return (
-    <section className={`review-process ${progress.status}`} aria-label="评审过程">
+    <section
+      className={`review-process ${progress.status}${expanded ? '' : ' collapsed'}`}
+      aria-label="评审过程"
+    >
       <header className="review-process-heading">
         <button
           className="review-process-toggle"
@@ -115,7 +118,9 @@ export function ReviewProcess({ progress }: { progress: ReviewProgress }) {
                 <p className="review-stream-waiting">
                   {progress.receivedChars
                     ? '模型正在输出，完整摘要与问题会陆续显示。'
-                    : '等待模型开始输出…'}
+                    : progress.phase === 'thinking'
+                      ? '模型正在分析改动，正文生成后会在这里显示。'
+                      : '等待模型开始输出…'}
                   <span className="review-stream-dots" aria-hidden="true">
                     ···
                   </span>
