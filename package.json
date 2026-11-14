@@ -3,7 +3,7 @@
   "productName": "CodeGuard",
   "version": "0.1.2",
   "private": true,
-  "description": "A local Git workbench for understanding and submitting changes.",
+  "description": "A Windows Git workbench for understanding local changes, reviewing what you are about to commit, and submitting it yourself.",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "node scripts/dev.mjs",
