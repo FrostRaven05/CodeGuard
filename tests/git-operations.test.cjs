@@ -331,3 +331,97 @@ test('认证和网络错误分类且隐藏 URL 凭据；无远端不猜测目标
     code: 'REMOTE_REQUIRED',
   });
 });
+
+test('远端未获取的新分支可检出并设置上游，随后拉取只更新该分支', async (t) => {
+  const f = await fixture(t);
+  await runGit(f.other, ['switch', '-c', 'feature/new']);
+  const remoteHead = await f.commit(f.other, 'new.txt', 'remote new\n');
+  await runGit(f.other, ['push', 'origin', 'HEAD:refs/heads/feature/new']);
+  f.write(f.repo, 'keep.txt', 'local untracked\n');
+  f.service.saveDraft(f.id, 'keep new branch draft');
+  const preview = await f.operations.prepare(f.id, {
+    kind: 'checkout',
+    remote: 'origin',
+    branch: 'feature/new',
+    localBranch: 'feature/new-local',
+  });
+  assert.equal(await f.head(), f.base);
+  assert.equal(preview.target, remoteHead);
+  assert.equal((await f.operations.options(f.id)).state.branch, 'main');
+  const checked = await f.operations.execute(f.id, preview.token);
+  assert.equal(checked.warning, null);
+  assert.equal(checked.state.branch, 'feature/new-local');
+  assert.equal(checked.state.head, remoteHead);
+  assert.equal(fs.readFileSync(path.join(f.repo, 'keep.txt'), 'utf8'), 'local untracked\n');
+  assert.equal(f.service.getWorkspace().drafts[f.id], 'keep new branch draft');
+  const options = await f.operations.options(f.id);
+  assert.equal(options.upstreamRemote, 'origin');
+  assert.equal(options.upstreamBranch, 'feature/new');
+  fs.unlinkSync(path.join(f.repo, 'keep.txt'));
+  const next = await f.commit(f.other, 'new.txt', 'remote next\n');
+  await runGit(f.other, ['push', 'origin', 'HEAD:refs/heads/feature/new']);
+  await f.perform({ kind: 'pull', remote: options.upstreamRemote, branch: options.upstreamBranch });
+  assert.equal(await f.head(), next);
+  assert.equal((await runGit(f.repo, ['rev-parse', 'refs/heads/main'])).stdout.trim(), f.base);
+});
+
+test('新建分支保留暂存内容和草稿，重复名称、非法名称与预览后同名创建拒绝执行', async (t) => {
+  const f = await fixture(t);
+  f.write(f.repo, 'staged.txt', 'staged\n');
+  await runGit(f.repo, ['add', '--', 'staged.txt']);
+  const before = await f.service.getState(f.id);
+  f.service.saveDraft(f.id, 'keep create draft');
+  const stagedTree = (await runGit(f.repo, ['write-tree'])).stdout;
+  const result = await f.perform({ kind: 'createBranch', localBranch: 'feature/local' });
+  assert.equal(result.state.branch, 'feature/local');
+  assert.equal(result.state.head, f.base);
+  assert.equal((await runGit(f.repo, ['write-tree'])).stdout, stagedTree);
+  assert.deepEqual(result.state.files, before.files);
+  assert.equal(f.service.getWorkspace().drafts[f.id], 'keep create draft');
+  await assert.rejects(
+    f.operations.prepare(f.id, { kind: 'createBranch', localBranch: 'feature/local' }),
+    { code: 'BRANCH_EXISTS' },
+  );
+  for (const localBranch of ['-bad', '../bad', 'a..b', 'bad\nname'])
+    await assert.rejects(f.operations.prepare(f.id, { kind: 'createBranch', localBranch }), {
+      code: 'INVALID_TARGET',
+    });
+  const preview = await f.operations.prepare(f.id, {
+    kind: 'createBranch',
+    localBranch: 'feature/raced',
+  });
+  await runGit(f.repo, ['branch', 'feature/raced']);
+  await assert.rejects(f.operations.execute(f.id, preview.token), { code: 'STALE_PREVIEW' });
+  assert.equal((await f.service.getState(f.id)).branch, 'feature/local');
+});
+
+test('远端检出拒绝来源变化与覆盖本地文件，失败不创建分支或改写工作文件', async (t) => {
+  const f = await fixture(t);
+  await runGit(f.other, ['switch', '-c', 'feature/checkout']);
+  await f.commit(f.other, 'source.txt', 'remote change\n');
+  await runGit(f.other, ['push', 'origin', 'HEAD:refs/heads/feature/checkout']);
+  const request = {
+    kind: 'checkout',
+    remote: 'origin',
+    branch: 'feature/checkout',
+    localBranch: 'feature/checkout',
+  };
+  let preview = await f.operations.prepare(f.id, request);
+  await runGit(f.repo, ['update-ref', 'refs/remotes/origin/feature/checkout', f.base]);
+  await assert.rejects(f.operations.execute(f.id, preview.token), { code: 'STALE_PREVIEW' });
+  // Ref moves back only in this disposable test fixture, never in a user repository.
+  preview = await f.operations.prepare(f.id, request);
+  f.write(f.repo, 'source.txt', 'local must survive\n');
+  preview = await f.operations.prepare(f.id, request);
+  await assert.rejects(f.operations.execute(f.id, preview.token));
+  assert.equal((await f.service.getState(f.id)).branch, 'main');
+  assert.equal(fs.readFileSync(path.join(f.repo, 'source.txt'), 'utf8'), 'local must survive\n');
+  assert.equal(
+    (
+      await runGit(f.repo, ['show-ref', '--verify', '--quiet', 'refs/heads/feature/checkout'], {
+        allowFailure: true,
+      })
+    ).code,
+    1,
+  );
+});

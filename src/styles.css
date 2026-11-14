@@ -147,15 +147,210 @@ button strong {
   position: absolute;
   top: calc(100% + 12px);
   left: 0;
-  width: 380px;
-  max-height: min(460px, calc(100vh - 90px));
-  overflow: auto;
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  max-height: min(600px, calc(100vh - 90px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   z-index: 35;
-  padding: 8px;
-  background: var(--panel-raised);
+  padding: 0;
+  background: #1c212a;
   border: 1px solid #414958;
-  border-radius: 8px;
-  box-shadow: 0 12px 36px #0007;
+  border-radius: 12px;
+  box-shadow:
+    0 18px 50px #0008,
+    0 2px 8px #0005;
+}
+.branch-menu-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  justify-content: space-between;
+  padding: 18px 18px 14px;
+  flex-shrink: 0;
+}
+.branch-menu-header strong {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
+}
+.branch-menu-header small {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 5px;
+}
+.branch-create-button {
+  color: #162d24;
+  background: var(--mint);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  padding: 7px 10px;
+}
+.branch-create-button:hover:not(:disabled) {
+  background: #97e7c9;
+}
+.branch-search {
+  margin: 0 16px 10px;
+  padding: 8px 10px;
+  border: 1px solid #39414f;
+  background: #141922;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #8090a6;
+  flex-shrink: 0;
+}
+.branch-search:focus-within {
+  border-color: #6ba58e;
+  box-shadow: 0 0 0 2px #72d9b414;
+}
+.branch-search input {
+  flex: 1;
+  width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  min-width: 0;
+  padding: 0;
+}
+.branch-search button {
+  padding: 0;
+  color: var(--muted);
+}
+.branch-list {
+  overflow-y: auto;
+  min-height: 0;
+  padding: 0 8px 10px;
+}
+.branch-section-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  min-height: 38px;
+  padding: 4px 10px;
+  color: #8fa0b6;
+  font-size: 12px;
+}
+.branch-section-heading small {
+  color: #7d8a9d;
+  margin-left: 5px;
+}
+.branch-section-heading button {
+  font-size: 12px;
+  padding: 4px 6px;
+  gap: 5px;
+  color: #a5b4c8;
+}
+.branch-row-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  background: #342d47;
+  color: var(--purple);
+  border-radius: 6px;
+}
+.branch-row-icon.remote {
+  color: #91bada;
+  background: #253443;
+}
+.branch-menu .branch-row-name {
+  display: block;
+  min-width: 0;
+}
+.branch-row-name strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 500;
+}
+.branch-menu .branch-row-name small {
+  display: block;
+  margin: 3px 0 0;
+  font-size: 12px;
+  color: #8999ad;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.branch-menu-row.is-current {
+  background: #282536;
+}
+.branch-current-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #9ed6bd;
+  white-space: nowrap;
+  margin-right: 10px;
+}
+.branch-menu-actions .branch-switch-action {
+  border: 1px solid #414450;
+  padding: 4px 9px;
+  background: #292d39;
+  color: #d0c6ec;
+}
+.branch-menu-actions .branch-merge-action {
+  color: #8fa0b6;
+  font-size: 12px;
+  gap: 4px;
+}
+.branch-empty {
+  font-size: 12px;
+  padding: 10px;
+  color: #798ba2;
+  line-height: 1.8;
+}
+.branch-menu-footer {
+  border-top: 1px solid #303745;
+  padding: 8px 12px 12px;
+  flex-shrink: 0;
+}
+.branch-menu-footer > button {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+  color: #b2c5d9;
+  font-size: 13px;
+  padding: 8px 6px;
+}
+.branch-menu-footer > button > svg:last-child {
+  margin-left: auto;
+  color: #7c91a6;
+}
+.branch-menu-footer p {
+  color: #78879a;
+  font-size: 12px;
+  padding: 5px 6px 0;
+}
+.branch-name-conflict {
+  display: flex;
+  gap: 9px;
+  padding: 10px 12px;
+  color: var(--amber);
+  border: 1px solid #63513b;
+  border-radius: 7px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.branch-name-conflict > svg {
+  margin-top: 4px;
+}
+.branch-name-conflict small {
+  font-size: 12px;
+  color: var(--muted);
+}
+.branch-name-conflict button {
+  padding: 3px 0;
 }
 .branch-menu-caption {
   display: flex;
@@ -167,8 +362,10 @@ button strong {
 .branch-menu-row {
   display: flex;
   align-items: center;
-  gap: 4px;
-  border-radius: 5px;
+  gap: 8px;
+  margin: 2px 0;
+  padding: 3px 5px 3px 0;
+  border-radius: 7px;
 }
 .branch-menu-row:hover {
   background: #2c313e;
@@ -201,6 +398,7 @@ button strong {
 }
 .branch-recovery {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 5px;
   border-bottom: 1px solid var(--line);

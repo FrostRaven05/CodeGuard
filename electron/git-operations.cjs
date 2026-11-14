@@ -8,7 +8,17 @@ const redact = (text) =>
   String(text)
     .replace(/([a-z][a-z\d+.-]*:\/\/)[^\s/@]+@/gi, '$1[凭据已隐藏]@')
     .replace(/([?&](?:token|key|password|secret|access_token)=)[^\s&#]+/gi, '$1[已隐藏]');
-const kinds = ['fetch', 'pull', 'push', 'switch', 'merge', 'continueMerge', 'abortMerge'];
+const kinds = [
+  'fetch',
+  'pull',
+  'push',
+  'switch',
+  'checkout',
+  'createBranch',
+  'merge',
+  'continueMerge',
+  'abortMerge',
+];
 
 class GitOperations {
   constructor(service) {
@@ -300,7 +310,10 @@ class GitOperations {
     }
     if (state.operation || state.files.some((f) => f.conflict))
       throw new WorkbenchError('请先完成或中止当前仓库操作。', 'OPERATION_IN_PROGRESS');
-    if (kind !== 'fetch' && (!state.head || (kind !== 'switch' && state.detached)))
+    if (
+      kind !== 'fetch' &&
+      (!state.head || (!['switch', 'checkout', 'createBranch'].includes(kind) && state.detached))
+    )
       throw new WorkbenchError('请先切换到有提交的本地分支。', 'BRANCH_REQUIRED');
     if (['pull', 'merge'].includes(kind) && state.files.length)
       throw new WorkbenchError(
@@ -420,6 +433,49 @@ class GitOperations {
         incoming: 0,
         unrelated: false,
       };
+      if (['createBranch', 'checkout'].includes(kind)) {
+        preview.localBranch = await this.branchName(root, request.localBranch);
+        const exists = await this.git(
+          root,
+          ['show-ref', '--verify', '--quiet', `refs/heads/${preview.localBranch}`],
+          { allowFailure: true },
+        );
+        if (exists.code !== 1)
+          throw new WorkbenchError(
+            '本地分支已存在或无法检查，请选择其他名称，或切换已有本地分支。',
+            'BRANCH_EXISTS',
+          );
+        preview.target = before.state.head;
+        preview.sourceName = before.state.branch;
+        preview.warnings.push(`将创建并切换到本地分支 ${preview.localBranch}，不会覆盖已有分支。`);
+      }
+      if (kind === 'checkout') {
+        const remote = options.remotes.find((item) => item.name === request.remote);
+        if (!remote || remote.name.startsWith('-'))
+          throw new WorkbenchError('请选择仓库中已配置的远端。', 'REMOTE_REQUIRED');
+        preview.remote = remote.name;
+        preview.addresses = remote.fetchUrls;
+        preview.branch = await this.branchName(root, request.branch);
+        preview.source = `refs/remotes/${remote.name}/${preview.branch}`;
+        await this.git(
+          root,
+          [
+            'fetch',
+            '--no-tags',
+            '--no-prune',
+            '--no-recurse-submodules',
+            '--',
+            remote.name,
+            `refs/heads/${preview.branch}:${preview.source}`,
+          ],
+          { timeout: 120000 },
+        );
+        preview.target = (
+          await this.git(root, ['rev-parse', '--verify', `${preview.source}^{commit}`])
+        ).stdout.trim();
+        preview.sourceName = `${remote.name}/${preview.branch}`;
+        preview.warnings.push(`上游设为 ${preview.sourceName}；完成后可使用顶部拉取更新此分支。`);
+      }
       if (['fetch', 'pull', 'push'].includes(kind)) {
         const remote = options.remotes.find((item) => item.name === request.remote);
         if (!remote || remote.name.startsWith('-'))
@@ -494,17 +550,17 @@ class GitOperations {
         preview.target = pull.target;
         preview.sourceName = `${pull.remote}/${pull.branch}`;
       }
-      if (['pull', 'merge', 'switch'].includes(kind)) {
+      if (['pull', 'merge', 'switch', 'checkout', 'createBranch'].includes(kind)) {
         Object.assign(preview, await this.compare(root, before.state.head, preview.target));
         if (kind === 'pull' && preview.localOnly && preview.incoming) {
           preview.canExecute = false;
           preview.warnings.push('本地与远端已经分叉。仅快进拉取不会执行，可单独预览显式合并。');
         }
-        if (kind !== 'switch' && preview.unrelated) {
+        if (['pull', 'merge'].includes(kind) && preview.unrelated) {
           preview.canExecute = false;
           preview.warnings.push('两个分支没有共同祖先，需在外部明确处理。');
         }
-        if (kind === 'switch' && before.state.files.length)
+        if (['switch', 'checkout', 'createBranch'].includes(kind) && before.state.files.length)
           preview.warnings.push(
             '本地改动仅在 Git 确认可安全保留时随分支切换；不会强制覆盖或自动 stash。',
           );
@@ -573,10 +629,51 @@ class GitOperations {
         if (sha !== preview.target)
           throw new WorkbenchError('来源分支已变化，请重新预览。', 'STALE_PREVIEW');
       }
+      if (['checkout', 'createBranch'].includes(preview.kind)) {
+        const exists = await this.git(
+          root,
+          ['show-ref', '--verify', '--quiet', `refs/heads/${preview.localBranch}`],
+          { allowFailure: true },
+        );
+        if (exists.code !== 1)
+          throw new WorkbenchError('目标本地分支已存在或无法检查，请重新预览。', 'STALE_PREVIEW');
+      }
       this.previews.delete(token); // A request with uncertain outcome must not be blindly retried.
       const { kind } = preview;
       let warning = null;
       try {
+        if (['checkout', 'createBranch'].includes(kind)) {
+          await this.git(root, [
+            '-c',
+            'submodule.recurse=false',
+            'switch',
+            '--no-guess',
+            '--no-track',
+            '-c',
+            preview.localBranch,
+            preview.target,
+          ]);
+          if (kind === 'checkout') {
+            try {
+              await this.git(root, [
+                'config',
+                '--local',
+                '--replace-all',
+                `branch.${preview.localBranch}.remote`,
+                preview.remote,
+              ]);
+              await this.git(root, [
+                'config',
+                '--local',
+                '--replace-all',
+                `branch.${preview.localBranch}.merge`,
+                `refs/heads/${preview.branch}`,
+              ]);
+            } catch {
+              warning = '新分支已创建并切换，但上游配置未完整保存，请核对分支配置后再拉取。';
+            }
+          }
+        }
         if (kind === 'fetch')
           await this.git(
             root,
@@ -680,7 +777,7 @@ class GitOperations {
         (state.head !== preview.head || state.branch !== preview.currentBranch)
       )
         warning = '已推送预览中的提交，但本地分支在执行期间发生变化，请核对实际状态。';
-      if (kind === 'switch' && state.head !== preview.target)
+      if (['switch', 'checkout', 'createBranch'].includes(kind) && state.head !== preview.target)
         warning = 'Git 已切换分支，但目标版本在执行期间发生变化，请核对实际状态。';
       if (kind === 'merge' || kind === 'pull') {
         const included = await this.git(
@@ -692,9 +789,14 @@ class GitOperations {
           warning = 'Git 已返回成功，但来源版本未确认完整合入，请核对实际历史和操作状态。';
       }
       if (
-        ['switch', 'pull', 'merge', 'continueMerge'].includes(kind) &&
+        ['switch', 'checkout', 'createBranch', 'pull', 'merge', 'continueMerge'].includes(kind) &&
         (state.detached ||
-          state.branch !== (kind === 'switch' ? preview.source.slice(11) : preview.currentBranch))
+          state.branch !==
+            (kind === 'switch'
+              ? preview.source.slice(11)
+              : ['checkout', 'createBranch'].includes(kind)
+                ? preview.localBranch
+                : preview.currentBranch))
       )
         warning = 'Git 已返回成功，但当前分支与预览不同，请核对实际状态。';
       return {
@@ -705,6 +807,8 @@ class GitOperations {
           push: '推送完成。',
           pull: '拉取完成（仅快进）。',
           switch: '分支已切换。',
+          checkout: '远端分支已检出为本地分支。',
+          createBranch: '新分支已创建并切换。',
           merge: '合并完成。',
           continueMerge: '合并提交已完成。',
           abortMerge: '合并已中止。',

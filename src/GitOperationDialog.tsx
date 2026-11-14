@@ -16,6 +16,8 @@ export const operationLabels: Record<GitOperationKind, string> = {
   pull: '拉取',
   push: '推送',
   switch: '切换分支',
+  checkout: '检出远端分支',
+  createBranch: '新建并切换分支',
   merge: '合并到当前分支',
   continueMerge: '继续合并',
   abortMerge: '中止合并',
@@ -43,7 +45,7 @@ export function GitOperationDialog({
   const [error, setError] = useState('');
   const [details, setDetails] = useState('');
   const label = operationLabels[request.kind];
-  const network = ['fetch', 'push', 'pull'].includes(request.kind);
+  const network = ['fetch', 'push', 'pull', 'checkout'].includes(request.kind);
   const branchOperation =
     request.kind === 'switch' || (request.kind === 'merge' && !request.pullToken);
   const branches =
@@ -58,6 +60,11 @@ export function GitOperationDialog({
     setError(reason instanceof Error ? reason.message : '操作失败，请刷新后核对。');
     setDetails(reason instanceof ApiError ? reason.details : '');
   }
+  const duplicateLocal = ['checkout', 'createBranch'].includes(request.kind)
+    ? options?.state.branches.find(
+        (branch) => !branch.remote && branch.name === request.localBranch,
+      )
+    : undefined;
   useEffect(() => {
     let alive = true;
     api
@@ -65,15 +72,37 @@ export function GitOperationDialog({
       .then((value) => {
         if (!alive) return;
         setOptions(value);
+        const sourceRemote = value.remotes
+          .filter((remote) => initial.source?.startsWith(`refs/remotes/${remote.name}/`))
+          .sort((a, b) => b.name.length - a.name.length)[0];
+        const sourceBranch = sourceRemote
+          ? initial.source!.slice(`refs/remotes/${sourceRemote.name}/`.length)
+          : '';
+        let suggestedName = sourceBranch;
+        for (
+          let suffix = 2;
+          suggestedName &&
+          value.state.branches.some((branch) => !branch.remote && branch.name === suggestedName);
+          suffix++
+        )
+          suggestedName = `${sourceBranch}-${suffix}`;
         setRequest((previous) => ({
           ...previous,
+          localBranch: previous.localBranch || suggestedName,
           remote:
             previous.remote ||
+            sourceRemote?.name ||
             (value.remotes.some((r) => r.name === value.upstreamRemote)
               ? value.upstreamRemote
               : '') ||
-            (previous.kind === 'fetch' && value.remotes.length === 1 ? value.remotes[0].name : ''),
-          branch: previous.branch || value.upstreamBranch || '',
+            (['fetch', 'checkout'].includes(previous.kind) && value.remotes.length === 1
+              ? value.remotes[0].name
+              : ''),
+          branch:
+            previous.branch ||
+            sourceBranch ||
+            (previous.kind === 'checkout' ? '' : value.upstreamBranch) ||
+            '',
           setUpstream: previous.setUpstream ?? !value.upstreamRemote,
         }));
       })
@@ -134,19 +163,23 @@ export function GitOperationDialog({
       }}
     >
       <p className="dialog-subtitle">
-        {request.kind === 'pull'
-          ? '预览时先获取所选远端分支，只允许快进更新。'
-          : request.kind === 'push'
-            ? '确认目标和提交后普通推送。'
-            : request.kind === 'switch'
-              ? '选择已有本地分支，Git 会检查本地改动能否安全保留。'
-              : request.kind === 'merge'
-                ? '将来源合并到当前分支，冲突保留并由你处理。'
-                : request.kind === 'continueMerge'
-                  ? '先在外部解决并暂存冲突，再预览合并提交。'
-                  : request.kind === 'abortMerge'
-                    ? '确认后由 Git 尝试恢复到合并前状态。'
-                    : '更新远端跟踪状态，不更新工作区文件。'}
+        {request.kind === 'checkout'
+          ? '先获取远端分支，再创建本地跟踪分支并切换；不会将其合并进当前分支。'
+          : request.kind === 'createBranch'
+            ? '基于当前提交创建并切换新分支；本地改动由 Git 检查能否安全保留。'
+            : request.kind === 'pull'
+              ? '预览时先获取所选远端分支，只允许快进更新。'
+              : request.kind === 'push'
+                ? '确认目标和提交后普通推送。'
+                : request.kind === 'switch'
+                  ? '选择已有本地分支，Git 会检查本地改动能否安全保留。'
+                  : request.kind === 'merge'
+                    ? '将来源合并到当前分支，冲突保留并由你处理。'
+                    : request.kind === 'continueMerge'
+                      ? '先在外部解决并暂存冲突，再预览合并提交。'
+                      : request.kind === 'abortMerge'
+                        ? '确认后由 Git 尝试恢复到合并前状态。'
+                        : '更新远端跟踪状态，不更新工作区文件。'}
       </p>
       {options && (
         <div className="settings-form operation-form">
@@ -181,7 +214,15 @@ export function GitOperationDialog({
                     disabled={busy}
                     placeholder="选择已有分支或输入目标名称"
                     list="operation-remote-branches"
-                    onChange={(e) => change({ branch: e.target.value })}
+                    onChange={(e) =>
+                      change({
+                        branch: e.target.value,
+                        ...(request.kind === 'checkout' &&
+                        (!request.localBranch || request.localBranch === request.branch)
+                          ? { localBranch: e.target.value }
+                          : {}),
+                      })
+                    }
                   />
                   <datalist id="operation-remote-branches">
                     {remoteBranches.map((b) => (
@@ -218,26 +259,77 @@ export function GitOperationDialog({
               onChange={(source) => change({ source })}
             />
           )}
+          {['checkout', 'createBranch'].includes(request.kind) && (
+            <label>
+              本地新分支名称
+              <input
+                name="localBranch"
+                autoFocus={request.kind === 'createBranch' || !!request.branch}
+                onKeyDown={(event) => {
+                  if (
+                    event.key === 'Enter' &&
+                    !preview &&
+                    !busy &&
+                    !duplicateLocal &&
+                    request.localBranch?.trim() &&
+                    (request.kind === 'createBranch' || (request.remote && request.branch))
+                  ) {
+                    event.preventDefault();
+                    void prepare();
+                  }
+                }}
+                aria-invalid={!!duplicateLocal}
+                aria-describedby={duplicateLocal ? 'branch-name-conflict' : undefined}
+                value={request.localBranch || ''}
+                disabled={busy}
+                placeholder="例如 feature/new-work"
+                onChange={(event) => change({ localBranch: event.target.value })}
+              />
+            </label>
+          )}
+          {duplicateLocal && (
+            <div className="branch-name-conflict" id="branch-name-conflict" role="status">
+              <AlertTriangle size={15} />
+              <div>
+                <p>本地已有 {duplicateLocal.name}，请换一个名称。</p>
+                {duplicateLocal.current ? (
+                  <small>你当前已在此分支。</small>
+                ) : (
+                  <button
+                    className="text-button"
+                    disabled={busy}
+                    onClick={() => change({ kind: 'switch', source: duplicateLocal.ref })}
+                  >
+                    改为切换此分支 <ArrowRight size={12} />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           {preview && (
             <section className="operation-preview" aria-label="操作预览">
               <div className="operation-direction">
                 <strong>
-                  {request.kind === 'push' || request.kind === 'switch'
-                    ? preview.currentBranch
-                    : preview.sourceName ||
-                      (preview.remote
-                        ? `${preview.remote}${preview.branch ? '/' + preview.branch : ''}`
-                        : preview.currentBranch)}
+                  {['checkout', 'createBranch'].includes(request.kind)
+                    ? preview.sourceName
+                    : request.kind === 'push' || request.kind === 'switch'
+                      ? preview.currentBranch
+                      : preview.sourceName ||
+                        (preview.remote
+                          ? `${preview.remote}${preview.branch ? '/' + preview.branch : ''}`
+                          : preview.currentBranch)}
                 </strong>
                 <ArrowRight size={15} />
                 <strong>
-                  {request.kind === 'push'
-                    ? `${preview.remote}/${preview.branch}`
-                    : request.kind === 'switch'
-                      ? preview.sourceName
-                      : request.kind === 'fetch'
-                        ? '远端跟踪引用'
-                        : preview.currentBranch}
+                  {['checkout', 'createBranch'].includes(request.kind)
+                    ? preview.localBranch
+                    : request.kind === 'push'
+                      ? `${preview.remote}/${preview.branch}`
+                      : request.kind === 'switch'
+                        ? preview.sourceName
+                        : request.kind === 'fetch'
+                          ? '远端跟踪引用'
+                          : preview.currentBranch}
                 </strong>
               </div>
               {!!preview.addresses?.length && (
@@ -345,8 +437,11 @@ export function GitOperationDialog({
                 className="primary"
                 disabled={
                   busy ||
+                  !!duplicateLocal ||
                   (network && (!request.remote || (request.kind !== 'fetch' && !request.branch))) ||
-                  (branchOperation && !request.source)
+                  (branchOperation && !request.source) ||
+                  (['checkout', 'createBranch'].includes(request.kind) &&
+                    !request.localBranch?.trim())
                 }
                 onClick={() => void prepare()}
               >

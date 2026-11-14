@@ -1,7 +1,7 @@
 {
   "name": "codeguard",
   "productName": "CodeGuard",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "private": true,
   "description": "A Windows Git workbench for understanding local changes, reviewing what you are about to commit, and submitting it yourself.",
   "main": "electron/main.cjs",

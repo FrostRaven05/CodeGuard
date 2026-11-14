@@ -20,6 +20,7 @@ export interface ChangeFile {
   submodule: boolean;
 }
 export interface Branch {
+  upstreamRef?: string | null;
   ref: string;
   symbolic: boolean;
   name: string;
@@ -160,8 +161,17 @@ export type ApiMethod =
   | 'history'
   | 'commitDetails';
 export type GitOperationKind =
-  'fetch' | 'pull' | 'push' | 'switch' | 'merge' | 'continueMerge' | 'abortMerge';
+  | 'fetch'
+  | 'pull'
+  | 'push'
+  | 'switch'
+  | 'checkout'
+  | 'createBranch'
+  | 'merge'
+  | 'continueMerge'
+  | 'abortMerge';
 export interface GitOperationRequest {
+  localBranch?: string;
   kind: GitOperationKind;
   remote?: string;
   branch?: string;
@@ -197,6 +207,7 @@ export interface RemoteChange {
   pushUrl?: string;
 }
 export interface GitOperationPreview {
+  localBranch?: string;
   token: string;
   repositoryId: string;
   kind: GitOperationKind;

@@ -333,7 +333,7 @@ class GitService {
     const branchesRaw = (
       await runGit(repository.root, [
         'for-each-ref',
-        '--format=%(refname)%00%(refname:short)%00%(objectname)%00%(HEAD)%00%(symref)',
+        '--format=%(refname)%00%(refname:short)%00%(objectname)%00%(HEAD)%00%(symref)%00%(upstream)',
         'refs/heads',
         'refs/remotes',
       ])
@@ -343,7 +343,7 @@ class GitService {
       .split('\n')
       .filter(Boolean)
       .map((line) => {
-        const [ref, name, sha, marker, symbolic] = line.split('\0');
+        const [ref, name, sha, marker, symbolic, upstreamRef] = line.split('\0');
         return {
           ref,
           symbolic: !!symbolic,
@@ -351,6 +351,7 @@ class GitService {
           hash: sha,
           current: marker === '*',
           remote: ref.startsWith('refs/remotes/'),
+          upstreamRef: upstreamRef || null,
         };
       });
     const operation =

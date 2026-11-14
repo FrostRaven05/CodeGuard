@@ -1514,6 +1514,123 @@ app
     console.log(
       'Sync UI passed: toolbar fetch/pull/push, branch-menu switch/merge, explicit previews and actual bare-remote results.',
     );
+    const menuCommand = async (text) => {
+      await window.webContents.executeJavaScript(
+        "if (!document.querySelector('.branch-menu')) document.querySelector('.current-branch').click()",
+      );
+      await waitOperationUI("document.querySelector('.branch-menu')");
+      await window.webContents.executeJavaScript(
+        `([...document.querySelectorAll('.branch-menu button')].find(button=>button.textContent===${JSON.stringify(text)})).click()`,
+      );
+      await waitOperationUI("document.querySelector('.operation-form input[name=localBranch]')");
+    };
+    const fillLocalBranch = (name) =>
+      window.webContents.executeJavaScript(`(() => {
+      const input=document.querySelector('.operation-form input[name=localBranch]');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(name)});
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+    })()`);
+    await menuCommand('新建分支');
+    await fillLocalBranch('main');
+    await waitOperationUI(
+      "document.querySelector('#branch-name-conflict') && document.querySelector('.operation-form .dialog-actions .primary').disabled",
+    );
+    await fillLocalBranch('feature/ui-created');
+    await previewAndExecute('新建并切换分支');
+    assert.equal((await service.getState(repository.id)).branch, 'feature/ui-created');
+    await branchAction('main', '切换');
+    await previewAndExecute('切换分支');
+    await runGit(peer, ['switch', '-c', 'feature/ui-remote']);
+    fs.writeFileSync(path.join(peer, 'new-remote.txt'), 'new branch from remote\n');
+    await runGit(peer, ['add', '--', 'new-remote.txt']);
+    await runGit(peer, ['commit', '-m', 'new remote branch']);
+    await runGit(peer, ['push', 'origin', 'HEAD:refs/heads/feature/ui-remote']);
+    await toolbarOperation('获取远端状态');
+    await previewAndExecute('获取远端');
+    await window.webContents.executeJavaScript("document.querySelector('.current-branch').click()");
+    await waitOperationUI(
+      "[...document.querySelectorAll('.branch-menu-row')].some(row=>row.querySelector('.branch-name')?.getAttribute('aria-label')==='浏览 origin/feature/ui-remote 历史')",
+    );
+    await window.webContents.executeJavaScript(
+      "[...document.querySelectorAll('.branch-menu-row')].find(row=>row.querySelector('.branch-name').getAttribute('aria-label')==='浏览 origin/feature/ui-remote 历史').querySelector('.branch-menu-actions button').click()",
+    );
+    await waitOperationUI(
+      "document.querySelector('.operation-form input[name=localBranch]')?.value==='feature/ui-remote'",
+    );
+    await previewAndExecute('检出远端分支');
+    assert.equal((await service.getState(repository.id)).branch, 'feature/ui-remote');
+    const upstream = await call('operationOptions', repository.id);
+    assert.equal(upstream.upstreamRemote, 'origin');
+    assert.equal(upstream.upstreamBranch, 'feature/ui-remote');
+    fs.writeFileSync(path.join(peer, 'new-remote.txt'), 'new branch advanced\n');
+    await runGit(peer, ['add', '--', 'new-remote.txt']);
+    await runGit(peer, ['commit', '-m', 'advance new branch']);
+    await runGit(peer, ['push', 'origin', 'HEAD:refs/heads/feature/ui-remote']);
+    await toolbarOperation('拉取（仅快进）');
+    await previewAndExecute('拉取', '获取并预览');
+    assert.equal(
+      fs.readFileSync(path.join(root, 'new-remote.txt'), 'utf8'),
+      'new branch advanced\n',
+    );
+    await branchAction('main', '切换');
+    await previewAndExecute('切换分支');
+    console.log(
+      'Branch creation UI passed: create and switch, discover new remote branch, checkout with upstream and fast-forward pull.',
+    );
+    await window.webContents.executeJavaScript("document.querySelector('.current-branch').click()");
+    await waitOperationUI("document.querySelector('[aria-label=搜索分支]')");
+    const fillBranchSearch = (text) =>
+      window.webContents.executeJavaScript(`(() => {
+      const input=document.querySelector('[aria-label=搜索分支]');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(text)});
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+    })()`);
+    await fillBranchSearch('UI-REMOTE');
+    await waitOperationUI("document.querySelectorAll('.branch-menu-row').length===2");
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.branch-menu section[aria-label=远端分支] .branch-switch-action').textContent",
+      ),
+      '切换',
+    );
+    assert.match(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.branch-menu section[aria-label=远端分支] .branch-row-name small').textContent",
+      ),
+      /feature\/ui-remote/,
+    );
+    if (process.env.CODEGUARD_SMOKE_BRANCH_MENU_CAPTURE) {
+      await fillBranchSearch('');
+      window.showInactive();
+      window.webContents.setBackgroundThrottling(false);
+      window.webContents.invalidate();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      fs.writeFileSync(
+        process.env.CODEGUARD_SMOKE_BRANCH_MENU_CAPTURE,
+        (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+      );
+    }
+    await fillBranchSearch('branch-does-not-exist');
+    await waitOperationUI("document.querySelectorAll('.branch-menu-row').length===0");
+    assert.match(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.branch-menu').textContent",
+      ),
+      /没有匹配/,
+    );
+    await fillBranchSearch('ui-remote');
+    await waitOperationUI("document.querySelectorAll('.branch-menu-row').length===2");
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.branch-menu section[aria-label=远端分支] .branch-switch-action').click()",
+    );
+    await waitOperationUI("document.querySelector('.operation-form .dialog-actions .primary')");
+    await previewAndExecute('切换分支');
+    assert.equal((await service.getState(repository.id)).branch, 'feature/ui-remote');
+    await branchAction('main', '切换');
+    await previewAndExecute('切换分支');
+    console.log(
+      'Branch menu UX passed: grouping, case-insensitive search, empty results, duplicate name feedback, and exact-upstream local switching.',
+    );
     fs.mkdirSync(path.join(root, 'feature', 'nested'), { recursive: true });
     fs.writeFileSync(path.join(root, 'feature', 'nested', 'tree.ts'), 'export const tree = 1;\n');
     await window.webContents.executeJavaScript(
