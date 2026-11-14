@@ -677,7 +677,9 @@ test('四样例验证工具完整运行、报告区分协议与人工语义，�
 });
 
 test('提交信息只发送固定暂存差异，预览不调用模型，草稿由用户确认后填写', async (t) => {
-  const f = await fixture(t, () => response({ message: '新增默认值处理\n\n保留零值作为默认值。' }));
+  const f = await fixture(t, () =>
+    response({ message: 'feat: 新增默认值处理\n\n保留零值作为默认值。' }),
+  );
   f.write('source.ts', 'WORKTREE_ONLY_MARKER\n');
   f.write('untracked.ts', 'UNTRACKED_ONLY_MARKER\n');
   f.git.saveDraft(f.id, '用户原草稿');
@@ -708,7 +710,7 @@ test('提交信息只发送固定暂存差异，预览不调用模型，草稿�
 });
 
 test('提交信息排除敏感路径、内容和二进制，空范围不发送', async (t) => {
-  const f = await fixture(t, () => response({ message: '新增处理逻辑' }));
+  const f = await fixture(t, () => response({ message: 'feat: 新增处理逻辑' }));
   f.write('.env.local', 'PRIVATE_ENV_MARKER=hidden\n');
   f.write('hidden.ts', 'export const password = "a-long-private-password";\n');
   f.write('ignored.ts', 'EXCLUDED_CONTENT_MARKER\n');
@@ -789,7 +791,7 @@ test('提交信息取消请求、重复请求互斥且之后可重试', async (t
   const f = await fixture(t, async () => {
     entered();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    return response({ message: '生成的草稿' });
+    return response({ message: 'feat: 生成的草稿' });
   });
   f.git.saveDraft(f.id, '原草稿');
   const preview = await f.reviews.commitMessages.prepare(f.id);
@@ -803,11 +805,14 @@ test('提交信息取消请求、重复请求互斥且之后可重试', async (t
   await rejection;
   assert.equal(f.git.getWorkspace().drafts[f.id], '原草稿');
   const retry = await f.reviews.commitMessages.prepare(f.id);
-  assert.equal((await f.reviews.commitMessages.start(f.id, retry.token)).message, '生成的草稿');
+  assert.equal(
+    (await f.reviews.commitMessages.start(f.id, retry.token)).message,
+    'feat: 生成的草稿',
+  );
 });
 
 test('提交信息预算限制完整差异，排除文件改名后仍不会发送', async (t) => {
-  const f = await fixture(t, () => response({ message: '新增普通逻辑' }));
+  const f = await fixture(t, () => response({ message: 'feat: 新增普通逻辑' }));
   f.write('excluded.ts', 'SECRET_PATH_MARKER\n');
   await runGit(f.repo, ['add', '--', '.']);
   await runGit(f.repo, ['commit', '-m', 'base']);
@@ -832,6 +837,47 @@ test('提交信息预算限制完整差异，排除文件改名后仍不会发�
   const sent = JSON.stringify(f.server.requests.at(-1).body.messages);
   assert.doesNotMatch(sent, /SECRET_PATH_MARKER|excluded.ts|renamed.ts|large.ts/);
   assert.ok(sent.length <= 8000);
+});
+
+test('生成提交信息校验 Conventional Commits 结构和 Unicode 标题长度，非法结果保留草稿', async (t) => {
+  let message = '';
+  const f = await fixture(t, () => response({ message }));
+  f.git.saveDraft(f.id, '原草稿');
+  const valid = [
+    'fix(review): 修复结果定位\n\n保留原始文件行号，避免跳转错误。',
+    'feat(api)!: 移除旧接口\n\nBREAKING CHANGE: 使用新版接口。',
+    'docs: 补充启动说明',
+    'chore: ' + '文'.repeat(65), // 72 Unicode code points, despite multibyte characters.
+    'test: 增加断言\r\n\r\n覆盖边界值。',
+  ];
+  for (message of valid) {
+    const prepared = await f.reviews.commitMessages.prepare(f.id);
+    const result = await f.reviews.commitMessages.start(f.id, prepared.token);
+    assert.equal(result.message, message.replaceAll('\r\n', '\n'));
+  }
+  const invalid = [
+    '修复结果定位',
+    'FIX: 修复结果定位',
+    'unknown: 修复结果定位',
+    'fix: ',
+    'fix(scope with spaces): 修复定位',
+    'fix: 修复定位\n缺少正文前空行',
+    'chore: ' + '文'.repeat(66),
+    '# fix: 不应包含 Markdown 标题',
+  ];
+  for (message of invalid) {
+    const prepared = await f.reviews.commitMessages.prepare(f.id);
+    await assert.rejects(f.reviews.commitMessages.start(f.id, prepared.token), {
+      code: 'COMMIT_MESSAGE_INVALID',
+    });
+    assert.equal(f.git.getWorkspace().drafts[f.id], '原草稿');
+  }
+  assert.equal(f.server.requests.length, valid.length + invalid.length);
+  const instructions = f.server.requests[0].body.messages.find(
+    (item) => item.role === 'system',
+  ).content;
+  assert.match(instructions, /Conventional Commits/);
+  assert.match(instructions, /72 个 Unicode 字符/);
 });
 
 test('组件化图示绑定暂存证据并持久化，旧记录无图示仍可读取', async (t) => {

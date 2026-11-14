@@ -669,25 +669,36 @@ app
         ),
         /生成提交信息/,
       );
+      await window.webContents.executeJavaScript(`(() => {
+        const input = document.querySelector('#commit-message');
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, '旧草稿');
+        input.dispatchEvent(new Event('input', { bubbles:true }));
+        window.__commitDialogSeen = false;
+        window.__commitDialogObserver = new MutationObserver(() => {
+          if(document.querySelector('[role=dialog][aria-label=生成提交信息]')) window.__commitDialogSeen = true;
+        });
+        window.__commitDialogObserver.observe(document.body, { childList:true, subtree:true });
+      })()`);
       await window.webContents.executeJavaScript(
-        "document.querySelector('[aria-label=生成提交信息]').click()",
-      );
-      await waitForCommitUI(
-        "document.querySelector('[role=dialog][aria-label=生成提交信息] .primary')",
-      );
-      assert.equal(
-        mock.requests.length,
-        beforeGeneration,
-        'Preparing a message must not call the model',
-      );
-      await window.webContents.executeJavaScript(
-        "document.querySelector('[role=dialog][aria-label=生成提交信息] .primary').click()",
+        "document.querySelector('[aria-label=生成提交信息]').click(); document.querySelector('[aria-label=生成提交信息]').click()",
       );
       await waitForCommitUI(
         "document.querySelector('#commit-message')?.value.includes('新增暂存版本内容')",
       );
       await waitForCommitUI("!document.querySelector('[aria-label=生成提交信息]').disabled");
       assert.equal(mock.requests.length, beforeGeneration + 1);
+      assert.match(
+        await window.webContents.executeJavaScript(
+          "document.querySelector('#commit-message').value",
+        ),
+        /^feat: 新增暂存版本内容\n\n/,
+      );
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "window.__commitDialogSeen || !!document.querySelector('[role=dialog][aria-label=生成提交信息]')",
+        ),
+        false,
+      );
       assert.match(JSON.stringify(mock.requests.at(-1)), /staged version/);
       assert.doesNotMatch(JSON.stringify(mock.requests.at(-1)), /worktree version/);
       await waitForCommitUI(
@@ -798,22 +809,10 @@ app
         window.hide();
       }
       console.log(
-        'Commit message UI: staged snapshot preview, generation, editable draft and persistence passed.',
+        'Commit message UI: one-click generation without a dialog, duplicate clicks send one request, conventional draft and persistence passed.',
       );
       await window.webContents.executeJavaScript(
         "document.querySelector('[aria-label=生成提交信息]').click()",
-      );
-      await waitForCommitUI(
-        "document.querySelector('[role=dialog][aria-label=生成提交信息] .primary')",
-      );
-      assert.match(
-        await window.webContents.executeJavaScript(
-          "document.querySelector('[role=dialog][aria-label=生成提交信息] .primary').textContent",
-        ),
-        /替换草稿/,
-      );
-      await window.webContents.executeJavaScript(
-        "document.querySelector('[role=dialog][aria-label=生成提交信息] .primary').click()",
       );
       await waitForCommitUI(
         "document.querySelector('.draft-caption').textContent.includes('正在生成')",
@@ -836,12 +835,8 @@ app
         "document.querySelector('[aria-label=生成提交信息]').click()",
       );
       await waitForCommitUI(
-        "document.querySelector('[role=dialog][aria-label=生成提交信息] .primary')",
+        "document.querySelector('.draft-caption')?.textContent.includes('正在生成')",
       );
-      await window.webContents.executeJavaScript(
-        "document.querySelector('[role=dialog][aria-label=生成提交信息] .primary').click()",
-      );
-      await waitForCommitUI("document.querySelector('.draft-caption button')");
       await window.webContents.executeJavaScript(
         "document.querySelector('.draft-caption button').click()",
       );
@@ -854,6 +849,8 @@ app
         ),
         '生成期间的人工编辑',
       );
+      assert.equal(await window.webContents.executeJavaScript('window.__commitDialogSeen'), false);
+      await window.webContents.executeJavaScript('window.__commitDialogObserver.disconnect()');
       console.log(
         'Commit message UI: concurrent manual edits and cancellation preserve the draft.',
       );

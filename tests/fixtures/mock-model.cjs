@@ -108,7 +108,9 @@ async function startMockModel({ commitMessageDelayMs = 0, reviewChunkDelayMs = 0
         ) {
           if (commitMessageDelayMs)
             await new Promise((resolve) => setTimeout(resolve, commitMessageDelayMs));
-          content = JSON.stringify({ message: '新增暂存版本内容\n\n记录本次提交的文件变化。' });
+          content = JSON.stringify({
+            message: 'feat: 新增暂存版本内容\n\n记录本次提交的文件变化。',
+          });
         }
       }
       if (body.stream) {
