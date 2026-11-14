@@ -8,7 +8,10 @@ const require = createRequire(import.meta.url);
 const owned = fs.mkdtempSync(path.join(os.tmpdir(), 'codeguard-desktop-test-'));
 const env = { ...process.env, CODEGUARD_SMOKE_ROOT: owned };
 delete env.ELECTRON_RUN_AS_NODE;
-const child = spawn(require('electron'), [path.resolve('tests/desktop-smoke.cjs')], {
+const fixture = process.argv.includes('--commit-message')
+  ? 'tests/commit-message-ui.cjs'
+  : 'tests/desktop-smoke.cjs';
+const child = spawn(require('electron'), [path.resolve(fixture)], {
   env,
   stdio: 'inherit',
   windowsHide: true,

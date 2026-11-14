@@ -52,14 +52,14 @@ export function CommitMessageComposer({
     setNeedsSettings(false);
     try {
       const prepared = await api.prepareCommitMessage(repositoryId);
-      if (!mounted.current || task.cancelled) return;
+      if (!mounted.current || task.cancelled || activeTask.current !== task) return;
       if (edits.current !== editVersion) {
         setFeedback('生成期间草稿已编辑，已保留你的内容。需要时可重新生成。');
         return;
       }
       setPhase('generating');
       const result = await api.generateCommitMessage(repositoryId, prepared.token);
-      if (!mounted.current || task.cancelled) return;
+      if (!mounted.current || task.cancelled || activeTask.current !== task) return;
       if (edits.current !== editVersion) {
         setFeedback('生成期间草稿已编辑，已保留你的内容。需要时可重新生成。');
         return;
@@ -72,13 +72,15 @@ export function CommitMessageComposer({
           : '已根据暂存内容生成，可继续编辑。',
       );
     } catch (error) {
-      if (mounted.current && !task.cancelled) {
+      if (mounted.current && !task.cancelled && activeTask.current === task) {
         setFeedback(error instanceof Error ? error.message : '生成失败，原草稿已保留。');
         setNeedsSettings(error instanceof ApiError && error.code === 'MODEL_NOT_CONFIGURED');
       }
     } finally {
-      if (activeTask.current === task) activeTask.current = null;
-      if (mounted.current) setPhase(null);
+      if (activeTask.current === task) {
+        activeTask.current = null;
+        if (mounted.current) setPhase(null);
+      }
     }
   }
 
@@ -95,7 +97,7 @@ export function CommitMessageComposer({
               : '根据暂存内容直接生成规范提交信息，成功后替换当前草稿'
           }
           disabled={generateDisabled}
-          onClick={() => void generate()}
+          onClick={generate}
         >
           {phase ? <LoaderCircle size={14} className="spin" /> : <Sparkles size={14} />}
           生成提交信息
@@ -122,14 +124,21 @@ export function CommitMessageComposer({
             <button
               className="text-button"
               onClick={() => {
-                if (activeTask.current) activeTask.current.cancelled = true;
+                const task = activeTask.current;
+                if (!task) return;
+                task.cancelled = true;
+                if (phase === 'preparing') {
+                  activeTask.current = null;
+                  setPhase(null);
+                  setFeedback('生成已取消，未发送模型请求，原草稿已保留。');
+                  return;
+                }
                 setFeedback('生成已取消，原草稿已保留；已发生的调用可能仍计费。');
                 if (repositoryId && phase === 'generating')
-                  void api
-                    .cancelCommitMessage(repositoryId)
-                    .catch((error: unknown) =>
-                      setFeedback(error instanceof Error ? error.message : '取消失败，请重试。'),
-                    );
+                  void api.cancelCommitMessage(repositoryId).catch((error: unknown) => {
+                    if (mounted.current && activeTask.current === task)
+                      setFeedback(error instanceof Error ? error.message : '取消失败，请重试。');
+                  });
               }}
             >
               <X size={12} />
