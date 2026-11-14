@@ -36,6 +36,9 @@ app
       visible: false,
       chooseDirectory: async () => root,
     });
+    // Keep React scheduler work active while this test window stays hidden.
+    // Chromium may otherwise defer UI updates as the background run gets longer.
+    window.webContents.setBackgroundThrottling(false);
     const executeFixtureScript = window.webContents.executeJavaScript.bind(window.webContents);
     window.webContents.executeJavaScript = async (script, ...args) => {
       try {
@@ -317,7 +320,11 @@ app
       }
       await menuKey('Escape');
     }
-    const mock = await startMockModel({ commitMessageDelayMs: 200, reviewChunkDelayMs: 65 });
+    const mock = await startMockModel({
+      commitMessageDelayMs: 200,
+      reviewChunkDelayMs: 25,
+      investigate: true,
+    });
     try {
       await window.webContents.executeJavaScript(
         "[...document.querySelectorAll('.toolbar button')].find(item => item.textContent.includes('模型设置')).click()",
@@ -537,7 +544,6 @@ app
         );
       const captureVisual = async (name) => {
         if (!process.env.CODEGUARD_SMOKE_VISUALS_DIR) return;
-        window.showInactive();
         window.webContents.setBackgroundThrottling(false);
         window.webContents.invalidate();
         await new Promise((resolve) => setTimeout(resolve, 150));
@@ -545,16 +551,121 @@ app
           path.join(process.env.CODEGUARD_SMOKE_VISUALS_DIR, name + '.png'),
           (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
         );
-        window.hide();
       };
       assert.equal(reviewed.visuals.changes.length, 1);
       assert.equal(reviewed.visuals.flows.length, 1);
-      await window.webContents.executeJavaScript(
-        "[...document.querySelectorAll('.review-actions button')].find(item => item.textContent.includes('评审本次提交')).click()",
+      assert.equal(reviewed.investigation.items.length, 1);
+      await window.webContents.executeJavaScript(`(() => {
+        window.__reviewPopupSeen = false;
+        window.__reviewPopupObserver = new MutationObserver(() => {
+          if(document.querySelector('[role=dialog]')) window.__reviewPopupSeen = true;
+        });
+        window.__reviewPopupObserver.observe(document.body, {childList:true,subtree:true});
+      })()`);
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "!!document.querySelector('.review-scope-switch')",
+        ),
+        false,
       );
-      await waitVisualUI("document.querySelector('[aria-label=关闭发送本次提交评审]')");
+      const originalLocalCapture = service.captureLocalReview.bind(service);
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "document.querySelectorAll('.review-actions .secondary').length",
+        ),
+        1,
+      );
+      await waitVisualUI(
+        "document.querySelector('.analysis-button')?.textContent.includes('评审本次提交') && !document.querySelector('.analysis-button').disabled",
+      );
+      const originalStagedBlob = (await runGit(root, ['rev-parse', ':source.ts'])).stdout.trim();
+      // Change the real index while the renderer still has the previous state.
+      // Routing must use the new state read after the click, rather than the old label.
+      await service.changeStaging(repository.id, 'source.ts', 'unstage');
+      let releaseLocalCapture;
+      let enteredLocalCapture;
+      const localCaptureEntered = new Promise((resolve) => {
+        enteredLocalCapture = resolve;
+      });
+      const localCaptureGate = new Promise((resolve) => {
+        releaseLocalCapture = resolve;
+      });
+      service.captureLocalReview = async (...args) => {
+        enteredLocalCapture();
+        await localCaptureGate;
+        return originalLocalCapture(...args);
+      };
+      const requestsBeforePreparation = mock.requests.length;
       await window.webContents.executeJavaScript(
-        "document.querySelector('[aria-label=关闭发送本次提交评审]').closest('[role=dialog]').querySelector('.primary').click()",
+        "document.querySelector('.analysis-button').click()",
+      );
+      await waitVisualUI("document.querySelector('.review-workspace .review-preparation')");
+      await Promise.race([
+        localCaptureEntered,
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Automatic local route did not reach snapshot preparation')),
+            5000,
+          ),
+        ),
+      ]);
+      assert.equal(mock.requests.length, requestsBeforePreparation);
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.review-actions .text-button').click()",
+      );
+      releaseLocalCapture();
+      await waitVisualUI(
+        "!document.querySelector('.analysis-button').disabled && document.querySelector('.review-workspace .review-error')?.textContent.includes('已取消准备')",
+      );
+      assert.equal(mock.requests.length, requestsBeforePreparation);
+      service.captureLocalReview = async () => {
+        throw new Error('fixture-preparation-failed');
+      };
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.analysis-button').click()",
+      );
+      await waitVisualUI(
+        "!document.querySelector('.analysis-button').disabled && document.querySelector('.review-workspace .review-error')?.textContent.includes('fixture-preparation-failed')",
+      );
+      assert.equal(mock.requests.length, requestsBeforePreparation);
+      service.captureLocalReview = originalLocalCapture;
+      const indexBeforeUnderstanding = fs.readFileSync(path.join(root, '.git', 'index'));
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.analysis-button').click();document.querySelector('.analysis-button').click()",
+      );
+      await waitVisualUI(
+        "document.querySelector('.review-process.running .review-stream-summary')",
+      );
+      assert.equal((await call('reviewProgress', repository.id, 'local')).status, 'running');
+      await waitVisualUI(
+        "document.querySelector('.visual-change-card')?.textContent.includes('固定工作区快照') && !document.querySelector('.review-actions .spin')",
+      );
+      assert.equal(mock.requests.length, requestsBeforePreparation + 2);
+      assert.match(JSON.stringify(mock.requests.at(-1)), /worktree version/);
+      assert.deepEqual(fs.readFileSync(path.join(root, '.git', 'index')), indexBeforeUnderstanding);
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.toolbar [aria-label=刷新]').click()",
+      );
+      await waitVisualUI(
+        "document.querySelector('.analysis-button')?.textContent.includes('理解全部本地改动') && !document.querySelector('.analysis-button').disabled",
+      );
+      await runGit(root, [
+        'update-index',
+        '--add',
+        '--cacheinfo',
+        '100644',
+        originalStagedBlob,
+        'source.ts',
+      ]);
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.toolbar [aria-label=刷新]').click()",
+      );
+      await waitVisualUI(
+        "document.querySelector('.analysis-button')?.textContent.includes('评审本次提交') && !document.querySelector('.analysis-button').disabled",
+      );
+      const beforeStagedReview = mock.requests.length;
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.analysis-button').click();document.querySelector('.analysis-button').click()",
       );
       await waitVisualUI(
         "document.querySelector('.review-process.running .review-stream-summary') && document.querySelector('.review-process.running .review-stream-finding')",
@@ -571,6 +682,25 @@ app
         "document.querySelector('.visual-change-card') && !document.querySelector('.review-actions .spin')",
       );
       assert.equal((await call('reviewProgress', repository.id, 'staged')).status, 'completed');
+      assert.equal(mock.requests.length, beforeStagedReview + 2);
+      const displayed = await window.webContents.executeJavaScript(
+        "document.querySelector('.review-workspace').dataset.reviewId",
+      );
+      assert.equal(
+        displayed,
+        (await call('reviewState', repository.id, 'staged')).latest.id,
+        'Completed UI must show this run, not the previous result awaiting reload',
+      );
+      assert.match(JSON.stringify(mock.requests.at(-1)), /staged version/);
+      assert.doesNotMatch(JSON.stringify(mock.requests.at(-1)), /worktree version/);
+      assert.equal(await window.webContents.executeJavaScript('window.__reviewPopupSeen'), false);
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "document.querySelectorAll('.review-actions .secondary').length",
+        ),
+        1,
+      );
+      await window.webContents.executeJavaScript('window.__reviewPopupObserver.disconnect()');
       assert.equal(
         await window.webContents.executeJavaScript(
           "document.querySelector('.review-process-toggle').getAttribute('aria-expanded')",
@@ -584,14 +714,63 @@ app
         /未暂存编辑保持独立/,
       );
       await captureVisual('review-behavior');
-      await visualTab('行为流程');
-      await waitVisualUI("document.querySelectorAll('.flow-node').length === 3");
-      await window.webContents.executeJavaScript(
-        "document.querySelectorAll('.flow-node')[1].click()",
-      );
       await waitVisualUI(
-        "document.querySelector('.flow-node-detail pre')?.textContent.includes('staged version')",
+        "document.querySelector('.investigation-card') && document.querySelector('.explanation-steps')",
       );
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "document.querySelectorAll('.visual-change-list .visual-flow-card').length",
+        ),
+        0,
+        'Behavior overview must not duplicate the impact flow',
+      );
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.investigation-proof summary').click()",
+      );
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.search-match summary').click()",
+      );
+      assert.match(
+        await window.webContents.executeJavaScript(
+          "document.querySelector('.search-match pre').textContent",
+        ),
+        /staged version/,
+      );
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "document.querySelectorAll('.visual-file-tree').length",
+        ),
+        0,
+      );
+      for (const width of [1080, 1440]) {
+        window.setSize(width, 950);
+        assert.equal(
+          await window.webContents.executeJavaScript(
+            "document.querySelector('.visual-review-content').getBoundingClientRect().width > 400",
+          ),
+          true,
+        );
+      }
+      // The overview also contains flow nodes. Wait for the target panel itself,
+      // rather than a node count or the parent tab highlight shared by both views.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (attempt) {
+          await visualTab('改动图解');
+          await waitVisualUI(
+            "document.querySelector('.explanation-steps') && !document.querySelector('.flow-disclaimer')",
+          );
+        }
+        await visualTab('影响流程');
+        await waitVisualUI(
+          "document.querySelector('.flow-disclaimer') && !document.querySelector('.explanation-steps') && document.querySelectorAll('.flow-node').length === 3",
+        );
+        await window.webContents.executeJavaScript(
+          "document.querySelectorAll('.flow-node')[1].click()",
+        );
+        await waitVisualUI(
+          "document.querySelectorAll('.flow-node')[1]?.getAttribute('aria-pressed') === 'true' && document.querySelector('.flow-node-detail pre')?.textContent.includes('staged version')",
+        );
+      }
       await window.webContents.executeJavaScript(
         "document.querySelector('[aria-label=放大流程图]').click()",
       );
@@ -605,10 +784,28 @@ app
         "document.querySelector('[aria-label=重置流程图缩放]').click()",
       );
       await captureVisual('review-flow');
-      await visualTab('风险发现');
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "parseFloat(getComputedStyle(document.querySelector('.flow-node span')).fontSize)>=14 && getComputedStyle(document.querySelector('.flow-node span')).webkitLineClamp==='none'",
+        ),
+        true,
+        'Flow labels stay readable without line clamping',
+      );
+      await visualTab('问题与建议');
       await waitVisualUI("document.querySelector('.visual-risk')");
+      assert.equal(
+        await window.webContents.executeJavaScript(
+          "document.querySelectorAll('.finding-disposition,.finding-filter,.visual-risk textarea,.visual-risk select').length",
+        ),
+        0,
+        'Suggestions do not expose manual disposition forms',
+      );
       await window.webContents.executeJavaScript(
-        "document.querySelector('.visual-file-item > button').click()",
+        `(() => {
+          const select = document.querySelector('[aria-label="图解文件筛选"]');
+          Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,'source.ts');
+          select.dispatchEvent(new Event('change',{bubbles:true}));
+        })()`,
       );
       await waitVisualUI(
         "document.querySelector('.visual-filter')?.textContent.includes('source.ts')",
@@ -622,7 +819,7 @@ app
       );
       await window.webContents.executeJavaScript("document.querySelector('.back-button').click()");
       await waitVisualUI(
-        "document.querySelector('.visual-review-tabs .active')?.textContent.startsWith('风险发现') && document.querySelector('.visual-filter')",
+        "document.querySelector('.visual-review-tabs .active')?.textContent.startsWith('问题与建议') && document.querySelector('.visual-filter')",
       );
       await window.webContents.executeJavaScript(`(() => {
         document.querySelector('.review-options').open=true;
@@ -714,7 +911,7 @@ app
         const compact = await window.webContents.executeJavaScript(`(() => {
           const panel = document.querySelector('.detail-panel');
           const bounds = panel.getBoundingClientRect();
-          const selectors = ['.generate-commit-button', '.preview-button', '.review-actions .secondary', '.review-open-workspace'];
+          const selectors = ['.generate-commit-button', '.commit-button', '.review-actions .secondary', '.review-open-workspace'];
           return {
             height: panel.clientHeight, content: panel.scrollHeight,
             changedFiles: (() => {
@@ -759,7 +956,7 @@ app
         assert.equal(
           await window.webContents.executeJavaScript(`(() => {
           const panel = document.querySelector('.detail-panel').getBoundingClientRect();
-          return ['.generate-commit-button', '.preview-button', '.review-actions .secondary'].every(selector => document.querySelector(selector).getBoundingClientRect().bottom <= panel.bottom);
+          return ['.generate-commit-button', '.commit-button', '.review-actions .secondary'].every(selector => document.querySelector(selector).getBoundingClientRect().bottom <= panel.bottom);
         })()`),
           true,
         );
@@ -862,9 +1059,81 @@ app
       new GitService(path.join(owned, 'workspace')).getWorkspace().drafts[repository.id],
       'desktop IPC smoke',
     );
-    const preview = await call('prepareCommit', repository.id);
-    const result = await call('commit', repository.id, preview.token, 'desktop IPC smoke');
-    assert.equal(result.treeMatchesPreview, true);
+    const waitCommitUI = (condition) =>
+      window.webContents.executeJavaScript(`new Promise((resolve,reject)=>{
+      const timer=setInterval(()=>{if(${condition}){clearInterval(timer);clearTimeout(deadline);resolve(true);}},25);
+      const deadline=setTimeout(()=>{clearInterval(timer);reject(new Error('Direct commit UI failed: '+${JSON.stringify(condition)}+' | '+document.querySelector('.notice')?.textContent));},7000);
+    })`);
+    await window.webContents.executeJavaScript(`(() => {
+      window.__commitPopupSeen=false;
+      window.__commitPopupObserver=new MutationObserver(()=>{if(document.querySelector('[role=dialog]'))window.__commitPopupSeen=true;});
+      window.__commitPopupObserver.observe(document.body,{childList:true,subtree:true});
+      const input=document.querySelector('#commit-message');
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,'');input.dispatchEvent(new Event('input',{bubbles:true}));
+    })()`);
+    await waitCommitUI("document.querySelector('.commit-button').disabled");
+    await window.webContents.executeJavaScript(`(() => {
+      const input=document.querySelector('#commit-message');
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,'test: 验证直接提交');input.dispatchEvent(new Event('input',{bubbles:true}));
+    })()`);
+    await waitCommitUI("!document.querySelector('.commit-button').disabled");
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.commit-button').textContent.trim()",
+      ),
+      '提交',
+    );
+    const preCommitHook = path.join(root, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(preCommitHook, '#!/bin/sh\necho fixture-commit-hook-rejected >&2\nexit 1\n', {
+      mode: 0o755,
+    });
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.commit-button').click();document.querySelector('.commit-button').click()",
+    );
+    await waitCommitUI(
+      "!document.querySelector('.commit-button').disabled && document.querySelector('.notice.error')?.textContent.includes('fixture-commit-hook-rejected')",
+    );
+    assert.equal((await service.getState(repository.id)).head, null);
+    assert.equal(
+      await window.webContents.executeJavaScript("document.querySelector('#commit-message').value"),
+      'test: 验证直接提交',
+    );
+    assert.equal(service.getWorkspace().drafts[repository.id], 'test: 验证直接提交');
+    fs.unlinkSync(preCommitHook);
+    const originalPrepareCommit = service.prepareCommit.bind(service);
+    const originalBlob = (await runGit(root, ['rev-parse', ':source.ts'])).stdout.trim();
+    let preparationCount = 0;
+    service.prepareCommit = async (id) => {
+      preparationCount++;
+      const prepared = await originalPrepareCommit(id);
+      const blob = (
+        await runGit(root, ['hash-object', '-w', '--stdin'], { input: 'concurrent index edit\n' })
+      ).stdout.trim();
+      await runGit(root, ['update-index', '--cacheinfo', '100644', blob, 'source.ts']);
+      return prepared;
+    };
+    await window.webContents.executeJavaScript("document.querySelector('.commit-button').click()");
+    await waitCommitUI(
+      "!document.querySelector('.commit-button').disabled && document.querySelector('.notice.error')?.textContent.includes('暂存内容或当前分支已变化')",
+    );
+    assert.equal(preparationCount, 1);
+    assert.equal((await service.getState(repository.id)).head, null);
+    assert.equal(service.getWorkspace().drafts[repository.id], 'test: 验证直接提交');
+    service.prepareCommit = originalPrepareCommit;
+    await runGit(root, ['update-index', '--cacheinfo', '100644', originalBlob, 'source.ts']);
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.commit-button').click();document.querySelector('.commit-button').click()",
+    );
+    await waitCommitUI(
+      "document.querySelector('.notice.success')?.textContent.includes('提交成功') && document.querySelector('#commit-message').value === ''",
+    );
+    const result = { hash: (await service.getState(repository.id)).head };
+    assert.equal((await runGit(root, ['rev-list', '--count', 'HEAD'])).stdout.trim(), '1');
+    assert.equal(await window.webContents.executeJavaScript('window.__commitPopupSeen'), false);
+    await window.webContents.executeJavaScript('window.__commitPopupObserver.disconnect()');
+    console.log(
+      'Direct commit UI passed: no dialog, empty message disabled, hook failure and stale snapshot preserve drafts, double click commits exactly once.',
+    );
     assert.equal((await call('reviewState', repository.id)).latest.stale, true);
     assert.equal((await call('history', repository.id))[0].hash, result.hash);
     assert.equal((await runGit(root, ['show', 'HEAD:source.ts'])).stdout, 'staged version\n');
@@ -1221,6 +1490,13 @@ app
       .trim()
       .split(' ');
     assert.deepEqual(parents.slice(1), [published, featureHead]);
+    await window.webContents.executeJavaScript(
+      "[...document.querySelectorAll('.view-tabs button')].find(button=>button.textContent.startsWith('当前改动')).click()",
+    );
+    await waitOperationUI(
+      "document.querySelector('.analysis-button')?.disabled && document.querySelector('.analysis-button').textContent.includes('理解全部本地改动')",
+    );
+    assert.equal((await service.getState(repository.id)).files.length, 0);
     if (process.env.CODEGUARD_SMOKE_SYNC_CAPTURE) {
       window.showInactive();
       window.webContents.setBackgroundThrottling(false);
@@ -1237,6 +1513,156 @@ app
     }
     console.log(
       'Sync UI passed: toolbar fetch/pull/push, branch-menu switch/merge, explicit previews and actual bare-remote results.',
+    );
+    fs.mkdirSync(path.join(root, 'feature', 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'feature', 'nested', 'tree.ts'), 'export const tree = 1;\n');
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.toolbar [aria-label=刷新]').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.file-tree-directory[open] .file-tree-directory[open] .file-select')",
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.file-tree-directory > summary').click()",
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.file-tree-directory').open",
+      ),
+      false,
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.file-tree-directory > summary').click(); document.querySelector('.file-tree .file-select').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.diff-title').textContent.includes('feature/nested/tree.ts')",
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.file-tree .file-action').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.diff-toolbar').textContent.includes('取消暂存')",
+    );
+    assert.equal(
+      (await service.getState(repository.id)).files.find(
+        (file) => file.path === 'feature/nested/tree.ts',
+      ).indexStatus,
+      'A',
+    );
+    console.log(
+      'File tree passed: nested directories, collapse/expand, file selection, and staging in a disposable repository.',
+    );
+    // Both paths coexist in Git's change set during file-to-directory replacement.
+    fs.writeFileSync(path.join(root, 'shape'), 'old file\n');
+    await runGit(root, ['add', '--', 'shape']);
+    await runGit(root, ['commit', '-m', 'fixture: file before directory replacement']);
+    fs.unlinkSync(path.join(root, 'shape'));
+    fs.mkdirSync(path.join(root, 'shape'));
+    fs.writeFileSync(path.join(root, 'shape', 'new.ts'), 'export const replacement = true;\n');
+    await runGit(root, ['add', '--all']);
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.toolbar [aria-label=刷新]').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.sidebar .file-select[title=shape]') && document.querySelector('.sidebar .file-select[title=\"shape/new.ts\"]')",
+    );
+    console.log(
+      'File tree replacement passed: deleted file and same-name added directory both remain visible.',
+    );
+    // Seed a separate repository before showing it, so background status refreshes
+    // cannot contend with fixture setup for the index lock.
+    const historyRoot = path.join(owned, 'history-tree-repository');
+    fs.mkdirSync(path.join(historyRoot, 'history', 'deep'), { recursive: true });
+    await runGit(historyRoot, ['init', '--initial-branch=main']);
+    for (const [key, value] of [
+      ['user.name', 'History Tree Test'],
+      ['user.email', 'history@example.invalid'],
+      ['commit.gpgsign', 'false'],
+      ['core.autocrlf', 'false'],
+      ['core.hooksPath', path.join(historyRoot, '.git', 'hooks')],
+    ])
+      await runGit(historyRoot, ['config', key, value]);
+    fs.writeFileSync(
+      path.join(historyRoot, 'history', 'deep', 'alpha.ts'),
+      'export const alpha = "committed alpha";\n',
+    );
+    fs.writeFileSync(
+      path.join(historyRoot, 'history', 'deep', 'beta.ts'),
+      'export const beta = "committed beta";\n',
+    );
+    await runGit(historyRoot, ['add', '--all']);
+    await runGit(historyRoot, ['commit', '-m', 'test: history file tree']);
+    fs.writeFileSync(
+      path.join(historyRoot, 'history', 'deep', 'beta.ts'),
+      'WORKTREE_ONLY_HISTORY_CANARY\n',
+    );
+    const historyRepository = await service.addRepository(historyRoot);
+    service.selectRepository(historyRepository.id);
+    await window.loadFile(path.resolve('dist/index.html'));
+    await waitForChangesUI("document.querySelector('.analysis-button')");
+    await window.webContents.executeJavaScript(
+      "[...document.querySelectorAll('.view-tabs button')].find(button=>button.textContent.startsWith('提交历史')).click()",
+    );
+    await waitForChangesUI(
+      'document.querySelector(\'.commit-row[title="test: history file tree"]\')',
+    );
+    await window.webContents.executeJavaScript(
+      'document.querySelector(\'.commit-row[title="test: history file tree"]\').click()',
+    );
+    await waitForChangesUI(
+      'document.querySelector(\'.history-files .file-tree-directory .file-tree-directory .history-file[title="history/deep/alpha.ts"]\')',
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.history-files summary[title=history]').click()",
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.history-files summary[title=history]').parentElement.open",
+      ),
+      false,
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('.history-files summary[title=history]').click(); document.querySelector('.history-file[title=\"history/deep/alpha.ts\"]').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.diff-title')?.textContent.includes('history/deep/alpha.ts') && document.querySelector('.history-file[aria-current=true]')?.title === 'history/deep/alpha.ts'",
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "!!document.querySelector('.diff-file-nav, [aria-label=切换差异文件列表]')",
+      ),
+      false,
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.diff-browser').getBoundingClientRect().width === document.querySelector('.diff-document').getBoundingClientRect().width",
+      ),
+      true,
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[aria-label=下一文件]').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.history-file[aria-current=true]')?.title === 'history/deep/beta.ts' && document.querySelector('.diff-lines')?.textContent.includes('committed beta')",
+    );
+    assert.equal(
+      await window.webContents.executeJavaScript(
+        "document.querySelector('.diff-lines').textContent.includes('WORKTREE_ONLY_HISTORY_CANARY')",
+      ),
+      false,
+    );
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[aria-label=上一文件]').click()",
+    );
+    await waitForChangesUI(
+      "document.querySelector('.history-file[aria-current=true]')?.title === 'history/deep/alpha.ts'",
+    );
+    await window.webContents.executeJavaScript("document.querySelector('.back-button').click()");
+    await waitForChangesUI(
+      "document.querySelector('.history-panel') && document.querySelector('.history-files .file-tree')",
+    );
+    console.log(
+      'History file tree passed: nested folders, collapse/expand, selection, previous/next highlight, committed snapshot and no duplicate diff list.',
     );
     console.log(
       'Desktop smoke passed: isolated renderer, preload/IPC, encrypted model settings, model HTTP, staged review, advisory finding, stale state, draft, commit and history.',

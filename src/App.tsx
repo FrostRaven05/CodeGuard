@@ -6,8 +6,6 @@ import {
   ArrowLeft,
   ArrowRight,
   Search,
-  PanelLeftClose,
-  PanelLeftOpen,
   ArrowUp,
   Check,
   CheckCircle2,
@@ -32,6 +30,7 @@ import {
 } from 'lucide-react';
 import { api, ApiError } from './api';
 import { DiffView } from './DiffView';
+import { FileTree } from './FileTree';
 import { layoutGraph } from './graph';
 import { ModelSettingsDialog } from './ModelSettingsDialog';
 import { ReviewPanel } from './ReviewPanel';
@@ -47,7 +46,6 @@ import type {
   ChangeFile,
   Commit,
   CommitDetails,
-  CommitPreview,
   DiffResult,
   DiffSelection,
   RepositoryState,
@@ -59,8 +57,6 @@ import type {
 
 type Notice = { kind: 'error' | 'success' | 'warning'; message: string; details?: string };
 const shortPath = (value: string) => value.split('/').pop() || value;
-const directoryOf = (value: string) =>
-  value.includes('/') ? value.slice(0, value.lastIndexOf('/') + 1) : '';
 const errorNotice = (error: unknown): Notice => ({
   kind: 'error',
   message: error instanceof Error ? error.message : '操作失败，请刷新后重试。',
@@ -90,15 +86,11 @@ export function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState('');
   const [historyVersion, setHistoryVersion] = useState(0);
-  const [diffFilesOpen, setDiffFilesOpen] = useState(true);
   const [reviewScope, setReviewScope] = useState<ReviewScope>('local');
-  const [commitReviewInfo, setCommitReviewInfo] = useState<ReviewState | null>(null);
   const [selectedCommit, setSelectedCommit] = useState<string | null>(null);
   const [commitDetails, setCommitDetails] = useState<CommitDetails | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const [preview, setPreview] = useState<CommitPreview | null>(null);
-  const [previewOpen, setPreviewOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -123,8 +115,6 @@ export function App() {
   const historyRequest = useRef(0);
   const overviewScroll = useRef<Record<string, number>>({ changes: 0, history: 0 });
   const draftQueue = useRef(new Map<string, Promise<unknown>>());
-  const closePreviewButton = useRef<HTMLButtonElement>(null);
-  const previewButton = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -173,15 +163,12 @@ export function App() {
     setHistorySearch('');
     setHistoryQuery('');
     setReviewScope('local');
-    setCommitReviewInfo(null);
     overviewScroll.current = { changes: 0, history: 0 };
     historyRequest.current++;
     setSelectedCommit(null);
     setCommitDetails(null);
     setSelection(null);
     setDiff(null);
-    setPreview(null);
-    setPreviewOpen(false);
     setReviewInfo(null);
     setReviewView({ tab: 'changes', file: '' });
     setRemotesOpen(false);
@@ -266,22 +253,6 @@ export function App() {
   }
 
   useEffect(() => {
-    if (!previewOpen || !activeId) return;
-    let disposed = false;
-    void api
-      .reviewState(activeId, 'staged')
-      .then((value) => {
-        if (!disposed) setCommitReviewInfo(value);
-      })
-      .catch(() => {
-        if (!disposed) setCommitReviewInfo(null);
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [previewOpen, activeId, state?.indexRevision, settingsVersion]);
-
-  useEffect(() => {
     if (!activeId || !selection) {
       setDiff(null);
       return;
@@ -333,19 +304,6 @@ export function App() {
     };
   }, [activeId, selectedCommit]);
 
-  useEffect(() => {
-    if (!previewOpen) return;
-    closePreviewButton.current?.focus();
-    const close = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !busyRef.current) {
-        setPreviewOpen(false);
-        previewButton.current?.focus();
-      }
-    };
-    document.addEventListener('keydown', close);
-    return () => document.removeEventListener('keydown', close);
-  }, [previewOpen]);
-
   const staged = state?.files.filter((file) => file.indexStatus !== '.' && !file.conflict) || [];
   const unstaged =
     state?.files.filter(
@@ -358,10 +316,6 @@ export function App() {
   const selectedFile = state?.files.find((file) => file.path === selection?.path);
   const draft = activeId ? drafts[activeId] || '' : '';
   const graph = useMemo(() => layoutGraph(history), [history]);
-  const previewStale =
-    !!preview &&
-    !!state &&
-    (state.repositoryId !== preview.repositoryId || state.indexRevision !== preview.indexRevision);
 
   function saveDraft(message: string) {
     if (!activeId) return;
@@ -445,23 +399,6 @@ export function App() {
     }
   }
 
-  async function prepareCommit() {
-    if (!activeId) return;
-    setBusy('准备提交');
-    setNotice(null);
-    try {
-      await draftQueue.current.get(activeId);
-      const next = await api.prepareCommit(activeId);
-      await refresh(activeId, true);
-      setPreview(next);
-      setPreviewOpen(true);
-    } catch (error) {
-      setNotice(errorNotice(error));
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function stageAll() {
     if (!activeId || busyRef.current) return;
     const id = activeId;
@@ -488,16 +425,18 @@ export function App() {
   }
 
   async function commit() {
-    if (!activeId || !preview) return;
+    if (!activeId || busyRef.current || !draft.trim()) return;
     const id = activeId;
+    const message = draft;
+    busyRef.current = '正在提交';
     setBusy('正在提交');
     setNotice(null);
     try {
       await draftQueue.current.get(id);
-      const result = await api.commit(id, preview.token, drafts[id] || '');
+      const prepared = await api.prepareCommit(id);
+      if (activeIdRef.current !== id) return;
+      const result = await api.commit(id, prepared.token, message);
       setDrafts((previous) => ({ ...previous, [id]: '' }));
-      setPreview(null);
-      setPreviewOpen(false);
       setSelection(null);
       setNotice({
         kind: result.warning ? 'warning' : 'success',
@@ -507,9 +446,9 @@ export function App() {
       await refresh(id, true);
     } catch (error) {
       setNotice(errorNotice(error));
-      if (error instanceof ApiError && error.code === 'STALE_PREVIEW') setPreview(null);
       await refresh(id, true);
     } finally {
+      busyRef.current = null;
       setBusy(null);
     }
   }
@@ -602,57 +541,58 @@ export function App() {
         </button>
         {!isCollapsed &&
           (files.length ? (
-            files.map((file) => {
-              const code = file.conflict
-                ? 'U'
-                : file.untracked
-                  ? '?'
-                  : scope === 'index'
-                    ? file.indexStatus
-                    : file.worktreeStatus;
-              const selected = selection?.scope === scope && selection.path === file.path;
-              return (
-                <div
-                  className={`file-row ${selected ? 'selected' : ''}`}
-                  key={`${scope}:${file.path}`}
-                >
-                  <button
-                    className="file-select"
-                    aria-current={selected ? 'true' : undefined}
-                    onClick={() => {
-                      selectView('changes');
-                      setSelection({ scope, path: file.path });
-                    }}
-                    title={file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}
+            <FileTree
+              files={files}
+              label={`${title}文件树`}
+              renderFile={(file) => {
+                const code = file.conflict
+                  ? 'U'
+                  : file.untracked
+                    ? '?'
+                    : scope === 'index'
+                      ? file.indexStatus
+                      : file.worktreeStatus;
+                const selected = selection?.scope === scope && selection.path === file.path;
+                return (
+                  <div
+                    className={`file-row ${selected ? 'selected' : ''}`}
+                    key={`${scope}:${file.path}`}
                   >
-                    <span className={`file-status status-${code}`}>{code}</span>
-                    <span className="file-path">
-                      <strong>{shortPath(file.path)}</strong>
-                      <small>
-                        {directoryOf(file.path) || '仓库根目录'}
-                        {file.previousPath ? ` ← ${file.previousPath}` : ''}
-                      </small>
-                    </span>
-                    {file.submodule ? (
-                      <span className="small-tag">子模块</span>
-                    ) : (
-                      <FileCode2 size={14} className="file-icon" />
-                    )}
-                  </button>
-                  <button
-                    className="icon-button file-action"
-                    disabled={!!busy}
-                    onClick={() =>
-                      void changeStaging(file, scope === 'index' ? 'unstage' : 'stage')
-                    }
-                    title={scope === 'index' ? '取消暂存整文件' : '暂存整文件'}
-                    aria-label={`${scope === 'index' ? '取消暂存' : '暂存'} ${file.path}`}
-                  >
-                    {scope === 'index' ? <Minus size={15} /> : <Plus size={15} />}
-                  </button>
-                </div>
-              );
-            })
+                    <button
+                      className="file-select"
+                      aria-current={selected ? 'true' : undefined}
+                      onClick={() => {
+                        selectView('changes');
+                        setSelection({ scope, path: file.path });
+                      }}
+                      title={file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}
+                    >
+                      <span className={`file-status status-${code}`}>{code}</span>
+                      <span className="file-path">
+                        <strong>{shortPath(file.path)}</strong>
+                        <small>{file.previousPath ? `← ${file.previousPath}` : ''}</small>
+                      </span>
+                      {file.submodule ? (
+                        <span className="small-tag">子模块</span>
+                      ) : (
+                        <FileCode2 size={14} className="file-icon" />
+                      )}
+                    </button>
+                    <button
+                      className="icon-button file-action"
+                      disabled={!!busy}
+                      onClick={() =>
+                        void changeStaging(file, scope === 'index' ? 'unstage' : 'stage')
+                      }
+                      title={scope === 'index' ? '取消暂存整文件' : '暂存整文件'}
+                      aria-label={`${scope === 'index' ? '取消暂存' : '暂存'} ${file.path}`}
+                    >
+                      {scope === 'index' ? <Minus size={15} /> : <Plus size={15} />}
+                    </button>
+                  </div>
+                );
+              }}
+            />
           ) : (
             <div className="group-empty">
               {scope === 'index' ? '选中的提交内容会出现在这里' : '没有文件'}
@@ -849,7 +789,7 @@ export function App() {
               onClick={() => selectView('review')}
             >
               <Sparkles size={14} />
-              可视化审查
+              改动图解
             </button>
           </nav>
           {notice && (
@@ -936,17 +876,6 @@ export function App() {
                   )}
               </div>
               <div className="diff-navigation-toolbar">
-                {(selection.scope === 'commit' || selection.scope === 'review') && (
-                  <button
-                    className="secondary"
-                    aria-label="切换差异文件列表"
-                    aria-pressed={diffFilesOpen}
-                    onClick={() => setDiffFilesOpen(!diffFilesOpen)}
-                  >
-                    {diffFilesOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
-                    文件列表
-                  </button>
-                )}
                 <span>
                   {diffFileIndex >= 0 ? `${diffFileIndex + 1} / ${diffFiles.length}` : '固定版本'}
                 </span>
@@ -970,23 +899,6 @@ export function App() {
                 </button>
               </div>
               <div className="diff-browser">
-                {diffFilesOpen &&
-                  (selection.scope === 'commit' || selection.scope === 'review') && (
-                    <nav className="diff-file-nav" aria-label="差异文件">
-                      {diffFiles.map((item, index) => (
-                        <button
-                          key={`${item.selection.scope}:${item.selection.path}`}
-                          className={index === diffFileIndex ? 'selected' : ''}
-                          aria-current={index === diffFileIndex ? 'true' : undefined}
-                          title={`${item.label} · ${item.selection.path}`}
-                          onClick={() => navigateDiff(item.selection)}
-                        >
-                          <span>{item.selection.path}</span>
-                          <small>{item.label}</small>
-                        </button>
-                      ))}
-                    </nav>
-                  )}
                 <div className="diff-document">
                   <div className="diff-title">
                     <FileDiff size={17} />
@@ -1268,21 +1180,29 @@ export function App() {
                     </span>
                   </div>
                   <button
-                    className="primary preview-button"
-                    ref={previewButton}
+                    className="primary commit-button"
+                    title={!draft.trim() ? '请先填写提交说明' : '提交已暂存内容，不推送'}
                     disabled={
-                      !state || !!busy || !staged.length || !!state.operation || !!conflicts
+                      !state ||
+                      !!busy ||
+                      !staged.length ||
+                      !!state.operation ||
+                      !!conflicts ||
+                      !draft.trim() ||
+                      state.locked
                     }
-                    onClick={() => void prepareCommit()}
+                    onClick={() => void commit()}
                   >
-                    {busy === '准备提交' ? (
+                    {busy === '正在提交' ? (
                       <LoaderCircle size={16} className="spin" />
                     ) : (
                       <GitCommitHorizontal size={16} />
                     )}
-                    预览提交
-                    <ChevronRight size={15} />
+                    {busy === '正在提交' ? '正在提交…' : '提交'}
                   </button>
+                  {state?.detached && (
+                    <p className="field-help">游离 HEAD：提交不会归入本地分支。</p>
+                  )}
                 </>
               ) : (
                 <>
@@ -1337,29 +1257,35 @@ export function App() {
                     改动文件 <span className="count">{commitDetails.files.length}</span>
                   </div>
                   <div className="history-files">
-                    {commitDetails.files.map((file) => (
-                      <button
-                        key={file.path}
-                        className={`history-file ${selection?.scope === 'commit' && selection.path === file.path ? 'selected' : ''}`}
-                        title={
-                          file.previousPath ? `${file.previousPath} → ${file.path}` : file.path
-                        }
-                        onClick={() =>
-                          setSelection({
-                            scope: 'commit',
-                            commit: commitDetails.commit.hash,
-                            path: file.path,
-                          })
-                        }
-                      >
-                        <span className={`file-status status-${file.status}`}>{file.status}</span>
-                        <span>
-                          {shortPath(file.path)}
-                          <small>{directoryOf(file.path)}</small>
-                        </span>
-                        <ChevronRight size={12} />
-                      </button>
-                    ))}
+                    <FileTree
+                      key={commitDetails.commit.hash}
+                      files={commitDetails.files}
+                      label="历史提交文件树"
+                      renderFile={(file) => (
+                        <button
+                          key={file.path}
+                          className={`history-file ${selection?.scope === 'commit' && selection.path === file.path ? 'selected' : ''}`}
+                          aria-current={
+                            selection?.scope === 'commit' && selection.path === file.path
+                              ? 'true'
+                              : undefined
+                          }
+                          title={
+                            file.previousPath ? `${file.previousPath} → ${file.path}` : file.path
+                          }
+                          onClick={() =>
+                            navigateDiff({
+                              scope: 'commit',
+                              commit: commitDetails.commit.hash,
+                              path: file.path,
+                            })
+                          }
+                        >
+                          <span className={`file-status status-${file.status}`}>{file.status}</span>
+                          <span>{shortPath(file.path)}</span>
+                        </button>
+                      )}
+                    />
                   </div>
                   <p className="hook-note">
                     {commitDetails.commit.parents.length
@@ -1444,153 +1370,6 @@ export function App() {
             void refresh(activeId, true);
           }}
         />
-      )}
-      {previewOpen && (
-        <div
-          className="modal-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !busy) setPreviewOpen(false);
-          }}
-        >
-          <section
-            className="commit-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="preview-title"
-            onKeyDown={(event) => {
-              if (event.key !== 'Tab') return;
-              const elements = [
-                ...event.currentTarget.querySelectorAll<HTMLButtonElement | HTMLTextAreaElement>(
-                  'button:not(:disabled),textarea:not(:disabled)',
-                ),
-              ];
-              const first = elements[0],
-                last = elements[elements.length - 1];
-              if (event.shiftKey && document.activeElement === first) {
-                event.preventDefault();
-                last?.focus();
-              } else if (!event.shiftKey && document.activeElement === last) {
-                event.preventDefault();
-                first?.focus();
-              }
-            }}
-          >
-            <div className="dialog-heading">
-              <div>
-                <h2 id="preview-title">确认这一次提交</h2>
-              </div>
-              <button
-                className="icon-button"
-                ref={closePreviewButton}
-                disabled={!!busy}
-                aria-label="关闭提交预览"
-                onClick={() => {
-                  setPreviewOpen(false);
-                  previewButton.current?.focus();
-                }}
-              >
-                <X size={19} />
-              </button>
-            </div>
-            <p className="dialog-subtitle">只提交下列暂存内容。此按钮完成提交，不会推送。</p>
-            <p className="review-advisory">
-              AI 评审：
-              {commitReviewInfo?.running && commitReviewInfo.runningScope === 'staged'
-                ? '正在进行'
-                : !commitReviewInfo?.latest
-                  ? '尚未评审'
-                  : commitReviewInfo.latest.stale ||
-                      (preview && commitReviewInfo.latest.tree !== preview.tree)
-                    ? '基于旧版本'
-                    : `${commitReviewInfo.latest.findings.length} 个待人工核对的问题${commitReviewInfo.latest.skipped.length || commitReviewInfo.latest.unverifiedCount ? ' · 部分覆盖' : ''}`}
-              。仅供参考，可以继续提交。
-            </p>
-            {preview ? (
-              <>
-                <div className="preview-target">
-                  <GitBranch size={16} />
-                  <strong>{preview.branch}</strong>
-                  <ChevronRight size={14} />
-                  <span>新提交</span>
-                </div>
-                <div className="preview-file-list">
-                  {preview.files.map((file) => (
-                    <div key={file.path}>
-                      <span className={`file-status status-${file.indexStatus}`}>
-                        {file.indexStatus}
-                      </span>
-                      <span>{file.path}</span>
-                    </div>
-                  ))}
-                </div>
-                <label htmlFor="preview-message" className="field-label">
-                  提交说明
-                </label>
-                <textarea
-                  id="preview-message"
-                  className="preview-message"
-                  value={draft}
-                  disabled={!!busy}
-                  onChange={(event) => saveDraft(event.target.value)}
-                  spellCheck={false}
-                />
-                {preview.detached && (
-                  <div className="inline-warning">
-                    <AlertTriangle size={14} />
-                    当前为游离 HEAD，新提交不会自动归入本地分支。
-                  </div>
-                )}
-                {previewStale && (
-                  <div className="inline-warning">
-                    <AlertTriangle size={14} />
-                    暂存内容或分支发生变化，请刷新预览。
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="inline-warning">
-                <AlertTriangle size={15} />
-                旧预览已失效。草稿已保留，请重新生成预览。
-              </div>
-            )}
-            {notice?.kind === 'error' && (
-              <div className="dialog-error">
-                <AlertCircle size={15} />
-                <div>
-                  {notice.message}
-                  {notice.details && <pre>{notice.details}</pre>}
-                </div>
-              </div>
-            )}
-            <p className="dialog-note">
-              Git 可能运行仓库配置的提交钩子。工具会保留真实结果，并核对实际提交内容。
-            </p>
-            <div className="dialog-actions">
-              <button className="secondary" disabled={!!busy} onClick={() => setPreviewOpen(false)}>
-                返回修改
-              </button>
-              {!preview || previewStale ? (
-                <button className="primary" disabled={!!busy} onClick={() => void prepareCommit()}>
-                  <RefreshCw size={14} />
-                  刷新预览
-                </button>
-              ) : (
-                <button
-                  className="primary"
-                  disabled={!!busy || !draft.trim()}
-                  onClick={() => void commit()}
-                >
-                  {busy === '正在提交' ? (
-                    <LoaderCircle size={15} className="spin" />
-                  ) : (
-                    <GitCommitHorizontal size={15} />
-                  )}
-                  {busy === '正在提交' ? '正在提交…' : `提交 ${preview.files.length} 个文件`}
-                </button>
-              )}
-            </div>
-          </section>
-        </div>
       )}
     </div>
   );

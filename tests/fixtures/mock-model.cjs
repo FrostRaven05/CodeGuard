@@ -1,7 +1,11 @@
 const http = require('node:http');
 
 // Explicitly opt-in, loopback-only HTTP fixture. It never calls an external model.
-async function startMockModel({ commitMessageDelayMs = 0, reviewChunkDelayMs = 0 } = {}) {
+async function startMockModel({
+  commitMessageDelayMs = 0,
+  reviewChunkDelayMs = 0,
+  investigate = false,
+} = {}) {
   const requests = [];
   const server = http.createServer(async (request, response) => {
     try {
@@ -101,6 +105,37 @@ async function startMockModel({ commitMessageDelayMs = 0, reviewChunkDelayMs = 0
               }
             : { changes: [], flows: [] },
         });
+        if (investigate && finding) {
+          const value = JSON.parse(content);
+          const location = {
+            path: finding.path,
+            side: finding.side,
+            line: finding.line,
+            evidence: finding.evidence,
+          };
+          if (!input.searchEvidence) {
+            value.investigations = [
+              {
+                id: 'h1',
+                title: '核对所选版本',
+                hypothesis: '所选暂存版本应独立于未暂存修改。',
+                queries: ['version'],
+                location,
+              },
+            ];
+          } else {
+            value.conclusions = [
+              {
+                id: 'h1',
+                verdict: 'refuted',
+                conclusion: '固定快照保留了所选版本，未读取工作区后续编辑。',
+                suggestion: '保持版本隔离；真实行为仍需运行检查。',
+                evidence: input.searchEvidence.hits[0].matches.slice(0, 1),
+              },
+            ];
+          }
+          content = JSON.stringify(value);
+        }
         if (
           body.messages.some(
             (item) => item.role === 'system' && item.content.includes('提交信息助手'),

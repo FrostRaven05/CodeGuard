@@ -9,6 +9,8 @@ const { collectContext } = require('./review-context.cjs');
 const { diffLines } = require('./review-evidence.cjs');
 const { normalizeVisuals } = require('./review-visuals.cjs');
 const { reviewStreamPreview } = require('./review-stream-preview.cjs');
+const { hypotheses, searchSnapshot, conclusions } = require('./review-investigation.cjs');
+const { fitDiff } = require('./review-budget.cjs');
 
 const digest = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const fingerprint = ({ scope, tree, head, ref, localRevision }) =>
@@ -39,7 +41,15 @@ contexts 是相同固定版本的补充片段，startLine/endLine 指明范围�
 另外返回可选 visuals 对象，用于本地组件展示行为解释，不生成 HTML、JSX、JavaScript、CSS 或工具代码。
 visuals 格式：{"changes":[{"title":"具体行为变化","before":"改动前","after":"改动后","location":{"path":"文件路径","side":"new","line":1,"evidence":"对应整行代码"}}],"flows":[{"title":"具体行为流程","nodes":[{"id":"n1","label":"处理步骤","kind":"step","location":{"path":"文件路径","side":"new","line":1,"evidence":"对应整行代码"}},{"id":"n2","label":"结束","kind":"end","location":null}],"edges":[{"from":"n1","to":"n2","label":"条件"}]}]}。
 最多 8 个变化卡片、3 个流程；每个流程 2–12 个节点、最多 24 条边。节点 kind 只用 start/step/decision/end；抽象节点 location 可为 null，但每个流程至少有一个可核对的代码位置。引用必须在 files 的差异内、使用对应版本的真实行号和连续整行摘录。流程用于解释局部行为，不声称真实调用关系或验证通过；无足够证据时用空数组，不编造图示。
+summary 不超过 300 字；对比卡只解释前后行为，每段不超过 180 字；流程只表达调用顺序或条件分支，节点用简短动作，不重复对比卡。files 中 partial=true 表示仅纳入部分差异，不得声称覆盖整个文件。
 不输出 Markdown、工具调用、完整源码、无证据的测试结果或自动修复命令。`;
+const INVESTIGATION_PROMPT = `
+主要目标是让使用者看懂这次改了什么。summary 说明行为与影响，visuals 必须优先给出有依据的改动前后对比和影响流程，不只列风险。
+先感知差异附近的 contexts，再提出 1–4 个需要跨文件核实的具体假设，在上述 JSON 增加 investigations 数组：[{"id":"h1","title":"待核实影响","hypothesis":"简明可检验的行为假设与触发条件，不输出内部思维过程","queries":["真实符号名"],"location":{"path":"改动文件","side":"new","line":1,"evidence":"真实整行"}}]。
+每项 1–3 个 3–80 字符的字面搜索词（源码符号或模块名，不是命令、正则、路径扫描请求），由本地服务在固定快照跨目录搜索后补充实际证据。尚未收到 searchEvidence 时不能自称已经全局搜索。
+收到 searchEvidence 后返回最终 summary/findings/visuals，并增加 conclusions：[{"id":"h1","verdict":"supported|refuted|uncertain","conclusion":"结合具体证据的简短结论及影响","suggestion":"修复方向或保留当前实现的建议","evidence":[{"path":"实际命中文件","side":"new","line":1,"evidence":"搜索返回的对应整行"}]}]。
+第一阶段先返回简短 summary、findings:[] 和 investigations，完整行为图解与结论留到收到 searchEvidence 后生成，避免提前下结论。
+结论要核对反证和已有处理；支持、反驳、证据不足分开，不将搜索未命中当作不存在，不称静态核对为测试通过。只给用户可核实的简明说明，不返回内部推理。`;
 
 function restrictedReferences(text, patterns) {
   return (text.match(/[A-Za-z0-9_./\\-]+/g) || []).filter(
@@ -134,10 +144,13 @@ function normalizeResult(content, files, hasRequirements) {
 }
 
 class ReviewService {
-  constructor(git, settings, { timeoutMs = 90000, fetchImpl } = {}) {
+  constructor(git, settings, { timeoutMs, reviewTimeoutMs, fetchImpl } = {}) {
     this.git = git;
     this.settings = settings;
-    this.transport = { timeoutMs, fetchImpl };
+    this.transport = { timeoutMs: timeoutMs ?? 90000, fetchImpl };
+    // Code review may spend longer reasoning before any answer text arrives.
+    // Explicit legacy timeouts still apply to all requests unless overridden.
+    this.reviewTransport = { timeoutMs: reviewTimeoutMs ?? timeoutMs ?? 300000, fetchImpl };
     this.commitMessages = new CommitMessageService(git, settings, this.transport);
     this.directory = path.join(path.dirname(git.storageFile), 'reviews');
     this.prepared = new Map();
@@ -310,7 +323,9 @@ class ReviewService {
           input: '',
         })
       ).stdout.trim();
-    const result = await this.git.readReviewDiff({ ...latest, base }, file, 700000);
+    const result = await this.git.readReviewDiff({ ...latest, base }, file, 700000, {
+      maxBlobBytes: 1000000,
+    });
     return {
       path: request.path,
       scope: 'review',
@@ -344,13 +359,26 @@ class ReviewService {
         : await this.git.captureStagedReview(id);
     snapshot.scope = scope;
     const included = [],
-      skipped = [];
+      skipped = [],
+      partialFiles = [],
+      candidates = [];
+    const searchBudget = Math.min(
+      14000,
+      Math.max(0, Math.floor((configuration.maxContextChars - 6000) / 5)),
+    );
     let remaining =
-      configuration.maxContextChars - SYSTEM.length - JSON.stringify(options).length - 1200;
+      configuration.maxContextChars -
+      SYSTEM.length -
+      INVESTIGATION_PROMPT.length -
+      searchBudget -
+      JSON.stringify(options).length -
+      480;
     if (remaining < 1000)
       throw new WorkbenchError('规范与需求超过上下文预算，请缩短内容或提高预算。', 'REVIEW_BUDGET');
     if (snapshot.files.length > 500)
       throw new WorkbenchError('所选改动超过 500 个文件，请缩小范围后分析。', 'REVIEW_BUDGET');
+    const contextReserve = Math.floor(remaining / 4);
+    let diffRemaining = remaining - contextReserve;
     for (const file of snapshot.files) {
       if (file.reason) {
         skipped.push({ path: file.path, reason: file.reason });
@@ -363,7 +391,9 @@ class ReviewService {
         skipped.push({ path: file.path, reason: '排除规则或敏感路径' });
         continue;
       }
-      const diff = await this.git.readReviewDiff(snapshot, file, Math.min(remaining, 100000));
+      const diff = await this.git.readReviewDiff(snapshot, file, 1000000, {
+        maxBlobBytes: 1000000,
+      });
       if (diff.reason) {
         skipped.push({ path: file.path, reason: diff.reason });
         continue;
@@ -374,14 +404,40 @@ class ReviewService {
         status: file.status,
         text: diff.text,
       };
-      const length = JSON.stringify(entry).length;
-      if (length > remaining) {
-        skipped.push({ path: file.path, reason: '总上下文预算不足' });
+      candidates.push(entry);
+    }
+    // Small diffs are retained in full; remaining space is shared by large diffs.
+    candidates.sort((a, b) => JSON.stringify(a).length - JSON.stringify(b).length);
+    for (let index = 0; index < candidates.length; index++) {
+      const entry = candidates[index];
+      const fullSize = JSON.stringify(entry).length;
+      const allowance = Math.floor(diffRemaining / (candidates.length - index));
+      const metadata = JSON.stringify({ ...entry, text: '' }).length;
+      const fitted =
+        fullSize <= allowance
+          ? { text: entry.text, partial: false }
+          : fitDiff(entry.text, Math.max(0, allowance - metadata - 30));
+      const selected = {
+        ...entry,
+        text: fitted.text,
+        ...(fitted.partial ? { partial: true } : {}),
+      };
+      const size = JSON.stringify(selected).length;
+      if (!fitted.text || size > diffRemaining) {
+        skipped.push({ path: entry.path, reason: '差异预算不足，未纳入本次分析' });
         continue;
       }
-      remaining -= length;
-      included.push(entry);
+      if (fitted.partial)
+        partialFiles.push({ path: entry.path, reason: '大差异已选取分散片段，未覆盖全部改动' });
+      diffRemaining -= size;
+      remaining -= size;
+      included.push(selected);
     }
+    included.sort(
+      (a, b) =>
+        snapshot.files.findIndex((file) => file.path === a.path) -
+        snapshot.files.findIndex((file) => file.path === b.path),
+    );
     const blockedPaths = new Set(skipped.map((file) => file.path));
     for (const file of snapshot.files) {
       if (
@@ -428,10 +484,12 @@ class ReviewService {
       snapshot,
       included,
       skipped,
+      partialFiles,
       configuration,
       options,
       context,
       blockedPaths,
+      searchBudget,
       createdAt,
     });
     return {
@@ -445,10 +503,11 @@ class ReviewService {
       baseUrl: configuration.baseUrl,
       included: included.map(({ path, text }) => ({ path, chars: text.length })),
       skipped,
+      partialFiles,
       contexts: context.contexts.map(({ text, ...item }) => ({ ...item, chars: text.length })),
       contextSkipped: context.skipped,
       contextLimitation: context.limitation,
-      chars: configuration.maxContextChars - remaining,
+      chars: configuration.maxContextChars - remaining - searchBudget,
       hasRequirements: Boolean(options.requirements.trim()),
       hasStandards: Boolean(options.standards.trim()),
       createdAt,
@@ -464,7 +523,7 @@ class ReviewService {
       prepared.snapshot.repositoryId !== id ||
       Date.now() - prepared.createdAt > 10 * 60_000
     )
-      throw new WorkbenchError('发送预览已失效，请重新准备评审。', 'STALE_REVIEW');
+      throw new WorkbenchError('分析快照已失效，请重新发起分析。', 'STALE_REVIEW');
     const { snapshot, included, skipped, configuration, options, context, blockedPaths } = prepared;
     const scope = snapshot.scope || 'staged';
     if (!included.length)
@@ -506,14 +565,14 @@ class ReviewService {
         digest(options) !== digest(this.load(id).options)
       )
         throw new WorkbenchError(
-          '所选改动、模型或评审依据已变化，请重新准备发送预览。',
+          '所选改动、模型或评审依据已变化，请重新发起分析。',
           'STALE_REVIEW',
         );
       const connection = this.settings.connection();
       this.prepared.delete(token);
       const startedAt = Date.now();
       const messages = [
-        { role: 'system', content: SYSTEM },
+        { role: 'system', content: SYSTEM + INVESTIGATION_PROMPT },
         {
           role: 'user',
           content: JSON.stringify({
@@ -533,7 +592,7 @@ class ReviewService {
         messages.reduce((sum, item) => sum + item.content.length, 0) > configuration.maxContextChars
       )
         throw new WorkbenchError('发送内容超过上下文预算，请缩小范围或提高预算。', 'REVIEW_BUDGET');
-      phase('requesting', '已发送固定差异，等待模型输出');
+      phase('requesting', '已发送固定差异与附近上下文，正在分析变化和提出假设');
       let lastUpdate = 0;
       const updatePreview = (content, force = false) => {
         if (controller.signal.aborted || progress.status !== 'running') return;
@@ -543,7 +602,8 @@ class ReviewService {
         if (!force && now - lastUpdate < 100) return;
         lastUpdate = now;
         progress.receivedChars = content.length;
-        if (progress.phase === 'requesting') phase('receiving', '正在接收模型输出');
+        if (['requesting', 'thinking'].includes(progress.phase))
+          phase('receiving', '正在接收模型输出');
         const preview = reviewStreamPreview(content);
         let safePreview = JSON.stringify(preview);
         if (connection.apiKey)
@@ -577,12 +637,110 @@ class ReviewService {
         }));
         this.publishProgress(progress);
       };
-      const response = await callModel(connection, messages, {
-        ...this.transport,
+      let response = await callModel(connection, messages, {
+        ...this.reviewTransport,
         stream: true,
+        onReasoning: () => {
+          if (!controller.signal.aborted && progress.phase === 'requesting')
+            phase('thinking', '模型正在分析改动，等待评审正文');
+        },
         onContent: updatePreview,
         signal: controller.signal,
       });
+      metrics.usage = response.usage;
+      // Older compatible services may omit the extension. Keep their result readable,
+      // but never represent the missing search stage as completed.
+      let investigation = null;
+      if (response.content.length > configuration.maxContextChars || sensitive(response.content))
+        throw new WorkbenchError(
+          '模型结果超过预算或包含敏感内容，未保存。',
+          'REVIEW_UNSAFE_RESULT',
+        );
+      let first;
+      try {
+        first = JSON.parse(
+          response.content
+            .trim()
+            .replace(/^```(?:json)?\s*/i, '')
+            .replace(/\s*```$/, ''),
+        );
+      } catch {
+        /* normal result validation below */
+      }
+      const plans = hypotheses(first?.investigations, included).filter(
+        (plan) =>
+          !restrictedReferences(JSON.stringify(plan), configuration.excludePatterns).length &&
+          ![...blockedPaths].some((relative) => JSON.stringify(plan).includes(relative)),
+      );
+      if (plans.length) {
+        metrics.usage = response.usage;
+        phase('searching', `已提出 ${plans.length} 个假设，正在跨目录搜索固定快照`);
+        const search = await searchSnapshot(
+          this.git,
+          snapshot,
+          plans,
+          configuration.excludePatterns,
+          blockedPaths,
+          prepared.searchBudget,
+          controller.signal,
+        );
+        const followup = messages.map((message, index) =>
+          index === 1
+            ? {
+                ...message,
+                content: JSON.stringify({
+                  ...JSON.parse(message.content),
+                  investigations: plans,
+                  searchEvidence: search,
+                }),
+              }
+            : message,
+        );
+        if (
+          followup.reduce((sum, item) => sum + item.content.length, 0) >
+          configuration.maxContextChars
+        )
+          throw new WorkbenchError('搜索证据超过上下文预算，请缩小范围。', 'REVIEW_BUDGET');
+        phase('concluding', `已扫描 ${search.stats.scanned} 个版本文件，正在核对假设与形成结论`);
+        progress.summary = '';
+        progress.findings = [];
+        const firstResponse = response;
+        response = await callModel(connection, followup, {
+          ...this.reviewTransport,
+          stream: true,
+          signal: controller.signal,
+          onContent: updatePreview,
+        });
+        const sum = (a, b) => (typeof a === 'number' && typeof b === 'number' ? a + b : null);
+        response.totalTokens = sum(firstResponse.totalTokens, response.totalTokens);
+        response.usage = Object.fromEntries(
+          ['promptTokens', 'completionTokens', 'totalTokens'].map((key) => [
+            key,
+            sum(firstResponse.usage?.[key], response.usage?.[key]),
+          ]),
+        );
+        if (response.content.length > configuration.maxContextChars || sensitive(response.content))
+          throw new WorkbenchError(
+            '模型结果超过预算或包含敏感内容，未保存。',
+            'REVIEW_UNSAFE_RESULT',
+          );
+        let final;
+        try {
+          final = JSON.parse(
+            response.content
+              .trim()
+              .replace(/^```(?:json)?\s*/i, '')
+              .replace(/\s*```$/, ''),
+          );
+        } catch {
+          /* normal result validation below */
+        }
+        investigation = {
+          items: conclusions(final?.conclusions, plans, search),
+          stats: search.stats,
+          limitation: search.limitation,
+        };
+      }
       updatePreview(response.content, true);
       metrics.usage = response.usage;
       phase('checking', '输出接收完成，核对格式与代码位置');
@@ -598,6 +756,18 @@ class ReviewService {
       ])
         safeContent = safeContent.replaceAll(JSON.stringify(relative).slice(1, -1), '[排除路径]');
       const result = normalizeResult(safeContent, included, Boolean(options.requirements.trim()));
+      if (investigation) {
+        let safeInvestigation = JSON.stringify(investigation);
+        for (const relative of [
+          ...blockedPaths,
+          ...restrictedReferences(safeInvestigation, configuration.excludePatterns),
+        ])
+          safeInvestigation = safeInvestigation.replaceAll(
+            JSON.stringify(relative).slice(1, -1),
+            '[排除路径]',
+          );
+        result.investigation = JSON.parse(safeInvestigation);
+      }
       const data = this.load(id);
       const previous = data[resultField(scope)];
       const keys = new Set(result.findings.map(findingKey));
@@ -639,6 +809,7 @@ class ReviewService {
         createdAt: Date.now(),
         included: included.map(({ path }) => path),
         skipped,
+        partialFiles: prepared.partialFiles,
         contexts: context.contexts.map(({ text, ...item }) => ({ ...item, chars: text.length })),
         contextSkipped: context.skipped,
         contextLimitation: context.limitation,

@@ -28,6 +28,76 @@ const response = (value = goodResult) => ({
   usage: { total_tokens: 123 },
 });
 
+test('改动解释先提出假设，再搜索跨目录固定版本并保存可重新读取的结论', async (t) => {
+  const anchor = { path: 'source.ts', side: 'new', line: 1, evidence: 'export const value = 0;' };
+  const plan = {
+    id: 'h1',
+    title: '调用方如何处理零值',
+    hypothesis: '调用方可能将合法零值当作缺失。',
+    queries: ['value'],
+    location: anchor,
+  };
+  const f = await fixture(t, (body) => {
+    const input = JSON.parse(body.messages[1].content);
+    if (!input.searchEvidence) return response({ ...goodResult, investigations: [plan] });
+    const match = input.searchEvidence.hits[0].matches.find(
+      (item) => item.path === 'feature/deep/use.ts' && item.side === 'new',
+    );
+    assert.ok(match, 'Must actually search outside the old same-directory context');
+    return response({
+      summary: '默认值改为零，调用方已有显式判断。',
+      findings: [],
+      visuals: {
+        changes: [{ title: '默认值调整', before: '默认一', after: '默认零', location: anchor }],
+        flows: [],
+      },
+      conclusions: [
+        {
+          id: 'h1',
+          verdict: 'refuted',
+          conclusion: '调用方按 undefined 区分缺失，合法零值会保留。',
+          suggestion: '保留现有判断，并补充零值测试。',
+          evidence: [match],
+        },
+      ],
+    });
+  });
+  f.write('source.ts', 'export const value = 1;\n');
+  f.write(
+    'feature/deep/use.ts',
+    'import { value } from "../../source";\nexport const used = value === undefined ? 1 : value;\n',
+  );
+  f.write('hidden/ignore.ts', 'value(EXCLUDED_SEARCH_CANARY);\n');
+  await runGit(f.repo, ['add', '--all']);
+  await runGit(f.repo, ['commit', '-m', 'fixture baseline']);
+  f.write('source.ts', 'export const value = 0;\n');
+  await runGit(f.repo, ['add', '--', 'source.ts']);
+  f.write('feature/deep/use.ts', 'UNSTAGED_SEARCH_CANARY(value);\n');
+  f.settings.save({ ...f.settings.getPublic(), excludePatterns: 'hidden/**' });
+  const before = (await runGit(f.repo, ['ls-files', '--stage'])).stdout;
+  const phases = [];
+  const unsubscribe = f.reviews.subscribeProgress((progress) => phases.push(progress.phase));
+  t.after(unsubscribe);
+  const result = await f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  assert.equal(f.server.requests.length, 2);
+  assert.equal(result.investigation.items[0].verdict, 'refuted');
+  assert.ok(result.investigation.stats.scanned > 0);
+  assert.equal(result.totalTokens, 246);
+  assert.ok(phases.includes('searching') && phases.includes('concluding'));
+  assert.doesNotMatch(
+    JSON.stringify(f.server.requests),
+    /UNSTAGED_SEARCH_CANARY|EXCLUDED_SEARCH_CANARY/,
+  );
+  assert.equal((await runGit(f.repo, ['ls-files', '--stage'])).stdout, before);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(f.reviews.file(f.id), 'utf8')).latest.investigation,
+    result.investigation,
+  );
+  const reloaded = await new ReviewService(f.git, f.settings).state(f.id);
+  assert.equal(reloaded.latest.stale, false);
+  assert.deepEqual(reloaded.latest.investigation, result.investigation);
+});
+
 const streamEvent = (value) => `data: ${JSON.stringify(value)}\n\n`;
 const streamDelta = (content) => ({
   choices: [{ index: 0, delta: { content }, finish_reason: null }],
@@ -127,6 +197,91 @@ async function fixture(t, handler, transport = {}) {
   const reviews = new ReviewService(git, settings, transport);
   return { directory, repo, git, id, settings, reviews, write, server, vault };
 }
+
+test('两阶段评审在结论生成时取消，保留上次结果与草稿且不自动重试', async (t) => {
+  let mode = 'legacy',
+    enterSecond,
+    releaseSecond;
+  const entered = new Promise((resolve) => {
+    enterSecond = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    releaseSecond = resolve;
+  });
+  const f = await fixture(t, async (body) => {
+    const input = JSON.parse(body.messages[1].content);
+    if (mode === 'legacy') return response();
+    if (!input.searchEvidence)
+      return response({
+        summary: '准备核对默认值。',
+        findings: [],
+        investigations: [
+          {
+            id: 'h1',
+            title: '核对默认值',
+            hypothesis: '调用方可能使用默认值。',
+            queries: ['value'],
+            location: {
+              path: 'source.ts',
+              side: 'new',
+              line: 1,
+              evidence: 'export const value = 0;',
+            },
+          },
+        ],
+      });
+    enterSecond();
+    await gate;
+    return response();
+  });
+  const previous = await f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  f.git.saveDraft(f.id, 'keep cancellation draft');
+  mode = 'investigate';
+  const running = f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  await entered;
+  f.reviews.cancel(f.id);
+  await assert.rejects(running, { code: 'REVIEW_CANCELLED' });
+  releaseSecond();
+  assert.equal((await f.reviews.state(f.id)).latest.id, previous.id);
+  assert.equal(f.git.getWorkspace().drafts[f.id], 'keep cancellation draft');
+  assert.equal(f.reviews.reviewProgress(f.id).status, 'cancelled');
+  assert.equal(f.server.requests.length, 3);
+});
+
+test('大文件的小改动读取固定完整字节做安全检查，仅发送小差异并预留有限搜索预算', async (t) => {
+  const f = await fixture(t, () => response({ summary: '改变默认值', findings: [] }));
+  const padding = '// unchanged context\n'.repeat(7000);
+  f.write('source.ts', padding + 'export const value = 1;\n');
+  await runGit(f.repo, ['add', '--all']);
+  await runGit(f.repo, ['commit', '-m', 'large file baseline']);
+  f.write('source.ts', padding + 'export const value = 0;\n');
+  await runGit(f.repo, ['add', '--all']);
+  const preview = await f.reviews.prepare(f.id);
+  assert.ok(preview.included.some((file) => file.path === 'source.ts'));
+  assert.ok(preview.contexts.some((item) => item.path === 'source.ts'));
+  assert.ok(Number.isFinite(f.reviews.prepared.get(preview.token).searchBudget));
+  await f.reviews.start(f.id, preview.token);
+  assert.ok(
+    f.server.requests[0].body.messages.reduce((sum, item) => sum + item.content.length, 0) <= 60000,
+  );
+});
+
+test('大差异采样及部分覆盖提示随结果保存和重读', async (t) => {
+  const f = await fixture(t, () => response({ summary: '新增大型测试', findings: [] }));
+  f.write(
+    'tests/large.test.cjs',
+    Array.from({ length: 8000 }, (_, i) => `const example${i} = ${i};`).join('\n'),
+  );
+  await runGit(f.repo, ['add', '--all']);
+  const preview = await f.reviews.prepare(f.id);
+  assert.ok(preview.included.some((item) => item.path === 'tests/large.test.cjs'));
+  assert.ok(preview.partialFiles.some((item) => item.path === 'tests/large.test.cjs'));
+  const result = await f.reviews.start(f.id, preview.token);
+  assert.deepEqual(
+    (await new ReviewService(f.git, f.settings).state(f.id)).latest.partialFiles,
+    result.partialFiles,
+  );
+});
 
 test('模型配置加密保存、密钥不回传，空值保留、清除和地址校验均生效', async (t) => {
   const f = await fixture(t);
@@ -554,7 +709,10 @@ test('上下文共同遵守排除、密钥检测、链接隔离和总请求预�
       (item) => item.path === 'link.ts' && item.reason.includes('符号链接'),
     ),
   );
-  assert.ok(preview.contextSkipped.some((item) => item.path === 'large.ts'));
+  assert.ok(
+    preview.contexts.some((item) => item.path === 'large.ts'),
+    'Large blob may still supply a small relevant snippet',
+  );
   await f.reviews.start(f.id, preview.token);
   const messages = f.server.requests[0].body.messages;
   assert.ok(messages.reduce((sum, item) => sum + item.content.length, 0) <= 4000);
@@ -606,7 +764,10 @@ test('上下文不足与未支持语言不会擦除已纳入差异的问题；�
   let preview = await f.reviews.prepare(f.id);
   const result = await f.reviews.start(f.id, preview.token);
   assert.equal(result.findings.length, 1);
-  assert.ok(preview.contextSkipped.some((file) => file.path === 'source.rs'));
+  assert.ok(
+    preview.contexts.some((file) => file.path === 'source.rs'),
+    'Other text languages retain nearby context without claiming function analysis',
+  );
   unsafe = true;
   preview = await f.reviews.prepare(f.id);
   await assert.rejects(f.reviews.start(f.id, preview.token), { code: 'REVIEW_UNSAFE_RESULT' });
@@ -921,6 +1082,19 @@ test('SSE 在完成前推送摘要与已核对位置的问题，过程按范围�
   const f = await fixture(t, async (body, output) => {
     assert.equal(body.stream, true);
     output.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const reasoning = streamEvent({
+      id: 'fixture',
+      object: 'chat.completion.chunk',
+      model: 'fixture',
+      choices: [
+        {
+          index: 0,
+          delta: { reasoning_content: 'private-reasoning-fixture' },
+          finish_reason: null,
+        },
+      ],
+    });
+    output.write(reasoning.repeat(Math.ceil(2100000 / Buffer.byteLength(reasoning))));
     output.write(streamEvent(streamDelta(content.slice(0, -2))));
     sent.resolve();
     await gate.promise;
@@ -963,9 +1137,29 @@ test('SSE 在完成前推送摘要与已核对位置的问题，过程按范围�
     events
       .map((event) => event.phase)
       .filter((phase, index, all) => index === 0 || all[index - 1] !== phase),
-    ['validating', 'requesting', 'receiving', 'checking', 'saving', 'completed'],
+    ['validating', 'requesting', 'thinking', 'receiving', 'checking', 'saving', 'completed'],
   );
   assert.ok(!fs.readFileSync(f.reviews.file(f.id), 'utf8').includes('receivedChars'));
+  assert.doesNotMatch(JSON.stringify(events), /private-reasoning-fixture/);
+  assert.doesNotMatch(fs.readFileSync(f.reviews.file(f.id), 'utf8'), /private-reasoning-fixture/);
+});
+
+test('评审可使用独立等待上限，连接测试仍及时超时，完成结果可重新读取', async (t) => {
+  const f = await fixture(
+    t,
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return response();
+    },
+    { timeoutMs: 40, reviewTimeoutMs: 2000 },
+  );
+  await assert.rejects(f.reviews.testConnection(), { code: 'MODEL_TIMEOUT' });
+  const result = await f.reviews.start(f.id, (await f.reviews.prepare(f.id)).token);
+  assert.equal(result.summary, goodResult.summary);
+  const reloaded = new ReviewService(f.git, f.settings);
+  const state = await reloaded.state(f.id);
+  assert.equal(state.latest.id, result.id);
+  assert.equal(state.latest.stale, false);
 });
 
 test('流式取消立即停止等待，不保存半成品并保留上次结果与提交草稿', async (t) => {

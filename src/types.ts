@@ -243,6 +243,7 @@ export interface ReviewOptions {
   requirements: string;
 }
 export interface ReviewPreview {
+  partialFiles?: { path: string; reason: string }[];
   scope: ReviewScope;
   token: string;
   repositoryId: string;
@@ -288,6 +289,29 @@ export interface Finding {
   evidenceStatus: string;
 }
 export interface ReviewResult {
+  partialFiles?: { path: string; reason: string }[];
+  investigation?: {
+    items: {
+      id: string;
+      title: string;
+      hypothesis: string;
+      queries: string[];
+      location: CodeLocation;
+      verdict: 'supported' | 'refuted' | 'uncertain';
+      conclusion: string;
+      suggestion: string;
+      evidence: CodeLocation[];
+      matches: (CodeLocation & { startLine: number; text: string })[];
+    }[];
+    stats: {
+      candidates: number;
+      scanned: number;
+      skipped: number;
+      truncated: boolean;
+      chars: number;
+    };
+    limitation: string;
+  };
   scope?: ReviewScope;
   previousFindings?: Finding[];
   visuals?: ReviewVisuals;
@@ -334,6 +358,7 @@ export interface ReviewVisuals {
   flows: ReviewFlow[];
 }
 export interface ReviewState {
+  preparation?: { label: string } | null;
   progress?: ReviewProgress | null;
   scope?: ReviewScope;
   options: ReviewOptions;

@@ -599,7 +599,7 @@ class GitService {
     });
   }
 
-  async readReviewDiff(snapshot, file, limit) {
+  async readReviewDiff(snapshot, file, limit, { maxBlobBytes = limit } = {}) {
     const repository = this.repository(snapshot.repositoryId);
     this.absolutePath(repository, file.path);
     if (file.previousPath) this.absolutePath(repository, file.previousPath);
@@ -618,7 +618,7 @@ class GitService {
           await runGit(repository.root, ['cat-file', '-s', `${revision}:${relativePath}`])
         ).stdout.trim(),
       );
-      if (size > limit) return { reason: '文件超过上下文预算' };
+      if (size > maxBlobBytes) return { reason: '文件超过安全读取上限' };
       const content = (await runGit(repository.root, ['show', `${revision}:${relativePath}`]))
         .stdout;
       if (content.includes('\0')) return { reason: '二进制文件' };
@@ -725,7 +725,7 @@ class GitService {
       if (!message.trim()) throw new WorkbenchError('请填写提交说明。', 'EMPTY_MESSAGE');
       const preview = this.previews.get(token);
       if (!preview || preview.repositoryId !== id || Date.now() - preview.createdAt > 15 * 60_000)
-        throw new WorkbenchError('提交预览已失效，请重新预览。', 'STALE_PREVIEW');
+        throw new WorkbenchError('本次提交准备已失效，请核对后重新点击提交。', 'STALE_PREVIEW');
       const state = await this.getState(id);
       if (state.operation || state.files.some((file) => file.conflict))
         throw new WorkbenchError('仓库操作状态已变化，请刷新后处理。', 'STALE_PREVIEW');
@@ -736,7 +736,7 @@ class GitService {
         signature.ref !== preview.ref
       )
         throw new WorkbenchError(
-          '暂存内容或当前分支已变化。草稿已保留，请刷新提交预览。',
+          '暂存内容或当前分支已变化。草稿已保留，请核对后重新提交。',
           'STALE_PREVIEW',
         );
       try {

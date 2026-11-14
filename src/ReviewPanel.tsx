@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowRight, LoaderCircle, Sparkles } from 'lucide-react';
 import { api } from './api';
-import { Modal } from './Modal';
 import { useFindingRevision, findingDisposition, flushFindingDrafts } from './findingDrafts';
 import {
   useReviewDraft,
@@ -13,7 +12,6 @@ import type {
   ModelSettings,
   RepositoryState,
   ReviewScope,
-  ReviewPreview,
   ReviewState,
   ReviewProgress,
 } from './types';
@@ -44,13 +42,21 @@ export function ReviewPanel({
   const options = draft.options;
   const setOptions = (value: typeof options) => saveReviewDraft(id, value);
   const [settings, setSettings] = useState<ModelSettings | null>(null);
-  const [preview, setPreview] = useState<ReviewPreview | null>(null);
-  const [preparing, setPreparing] = useState(false);
+  const [preparation, setPreparation] = useState<ReviewState['preparation']>(null);
+  const preparing = Boolean(preparation);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
   const alive = useRef(true),
     request = useRef(0);
   const currentScope = useRef(scope);
+  const activeTask = useRef<{ target: ReviewScope; cancelled: boolean; started: boolean } | null>(
+    null,
+  );
+  const nextScope: ReviewScope = repository.files.some(
+    (file) => file.indexStatus !== '.' && !file.untracked,
+  )
+    ? 'staged'
+    : 'local';
   currentScope.current = scope;
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
@@ -66,10 +72,17 @@ export function ReviewPanel({
       if (alive.current) setError(reason instanceof Error ? reason.message : '无法读取评审。');
     }
   }, [id, scope]);
+  const updateRef = useRef(update);
+  updateRef.current = update;
+  useEffect(
+    () => () => {
+      if (activeTask.current && !activeTask.current.started) activeTask.current.cancelled = true;
+    },
+    [id],
+  );
   useEffect(() => {
     alive.current = true;
     setReview(null);
-    setPreview(null);
     void update();
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') void update();
@@ -134,60 +147,81 @@ export function ReviewPanel({
       .modelSettings()
       .then((value) => mounted && setSettings(value))
       .catch((reason) => mounted && setError(reason.message));
-    setPreview(null);
     return () => {
       mounted = false;
     };
   }, [settingsVersion]);
-  async function prepare(target: ReviewScope = scope) {
-    onScope(target);
+  async function prepare() {
+    if (activeTask.current || pending || review?.running) return;
     if (!settings?.baseUrl) {
       onSettings();
       return;
     }
-    setPreparing(true);
-    setError('');
-    try {
-      await flushReviewDraft(id);
-      await flushFindingDrafts(id, target);
-      const value = await api.prepareReview(id, target);
-      if (alive.current) setPreview(value);
-      await update();
-    } catch (reason) {
-      if (alive.current) setError(reason instanceof Error ? reason.message : '无法准备评审。');
-    } finally {
-      if (alive.current) setPreparing(false);
-    }
-  }
-  async function start() {
-    if (!preview) return;
-    const token = preview.token;
-    setPreview(null);
-    setPending(true);
-    setReview((previous) => (previous ? { ...previous, progress: null } : previous));
+    const task = { target: nextScope, cancelled: false, started: false };
+    activeTask.current = task;
+    setPreparation({ label: '核对当前暂存状态…' });
     setError('');
     onOpen();
     try {
-      await api.startReview(id, token);
+      const current = await api.state(id);
+      if (!alive.current || task.cancelled) return;
+      if (!current.files.length) throw new Error('没有可分析的本地改动。');
+      const target: ReviewScope = current.files.some(
+        (file) => file.indexStatus !== '.' && !file.untracked,
+      )
+        ? 'staged'
+        : 'local';
+      task.target = target;
+      onScope(target);
+      setPreparation({ label: '保存评审依据与问题处置…' });
+      await flushReviewDraft(id);
+      await flushFindingDrafts(id, target);
+      if (!alive.current || task.cancelled) return;
+      setPreparation({
+        label: target === 'local' ? '准备全部本地改动的固定快照…' : '准备本次提交的暂存快照…',
+      });
+      const value = await api.prepareReview(id, target);
+      if (!alive.current || task.cancelled || currentScope.current !== target) return;
+      setPending(true);
+      setPreparation(null);
+      setReview((previous) => ({
+        ...(previous?.scope === target
+          ? previous
+          : { scope: target, options, latest: null, running: false, error: null }),
+        progress: null,
+        error: null,
+      }));
+      task.started = true;
+      await api.startReview(id, value.token);
     } catch (reason) {
-      if (alive.current) setError(reason instanceof Error ? reason.message : '评审失败。');
+      if (alive.current && !task.cancelled)
+        setError(reason instanceof Error ? reason.message : '评审失败。');
     } finally {
+      if (activeTask.current === task) activeTask.current = null;
       if (alive.current) {
-        setPending(false);
-        await update();
+        setPreparation(null);
+        await updateRef.current();
+        if (alive.current) setPending(false);
       }
     }
   }
   async function cancel() {
     try {
+      if (activeTask.current) {
+        activeTask.current.cancelled = true;
+        if (!activeTask.current.started) {
+          setError('已取消准备，未发送模型请求；已有结果与草稿保留。');
+          return;
+        }
+      }
       await api.cancelReview(id);
-      await update();
+      await updateRef.current();
     } catch (reason) {
       if (alive.current) setError(reason instanceof Error ? reason.message : '取消失败。');
     }
   }
   const latest = review?.scope === scope ? review.latest : null;
-  const running = pending || review?.running;
+  const running = preparing || pending || review?.running;
   const dirty = Boolean(
     review &&
     (options.standards !== review.options.standards ||
@@ -195,70 +229,54 @@ export function ReviewPanel({
   );
   const stale = Boolean(latest?.stale || dirty);
   useEffect(() => {
-    if (review && review.scope === scope)
-      onStateRef.current({
-        ...review,
-        running: Boolean(pending || review.running),
-        latest: latest ? { ...latest, stale } : null,
-      });
-  }, [review, latest, stale, pending, scope]);
-  const staged = repository.files.filter(
-    (file) => file.indexStatus !== '.' && !file.conflict,
-  ).length;
+    const current = review?.scope === scope ? review : null;
+    onStateRef.current({
+      ...(current || { scope, options, latest: null, running: false, error: null }),
+      preparation,
+      progress: preparing ? null : current?.progress || null,
+      running: Boolean(preparing || pending || current?.running),
+      runningScope: preparing || pending ? scope : current?.runningScope,
+      latest: latest ? { ...latest, stale } : null,
+      error: error || current?.error || null,
+    });
+  }, [review, latest, stale, pending, scope, preparation, preparing, error, options]);
+  const actionScope = running
+    ? activeTask.current?.target || review?.runningScope || scope
+    : nextScope;
   return (
     <section className="review-panel" aria-label="改动理解与评审">
-      <div className="review-scope-switch" role="group" aria-label="分析范围">
-        <button
-          className={scope === 'local' ? 'active' : ''}
-          aria-pressed={scope === 'local'}
-          disabled={!!running || preparing || !draft.initialized}
-          onClick={() => onScope('local')}
-        >
-          全部本地改动
-        </button>
-        <button
-          className={scope === 'staged' ? 'active' : ''}
-          aria-pressed={scope === 'staged'}
-          disabled={!!running || preparing || !draft.initialized}
-          onClick={() => onScope('staged')}
-        >
-          本次提交
-        </button>
-      </div>
       <p className="field-help">
-        {scope === 'local'
+        {actionScope === 'local'
           ? '理解当前工作区和未跟踪文件，不会暂存。'
           : '仅评审已暂存内容，与未暂存编辑分开。'}
       </p>
       <div className="review-actions">
         <button
-          className="secondary understand-local-button"
+          className="secondary analysis-button"
+          title={
+            !repository.files.length
+              ? '没有可分析的本地改动'
+              : actionScope === 'staged'
+                ? '仅评审已暂存的本次提交内容'
+                : '理解全部本地改动，不会暂存'
+          }
           disabled={preparing || !!running || !repository.files.length || !draft.initialized}
-          onClick={() => void prepare('local')}
-        >
-          <Sparkles size={16} />
-          {scope === 'local' && preparing
-            ? '准备范围…'
-            : scope === 'local' && running
-              ? '正在理解改动…'
-              : '理解全部本地改动'}
-        </button>
-        <button
-          className="secondary"
-          title="仅评审已暂存的内容"
-          disabled={preparing || !!running || !staged || !draft.initialized}
-          onClick={() => void prepare('staged')}
+          onClick={() => void prepare()}
         >
           {preparing || running ? (
             <LoaderCircle size={16} className="spin" />
           ) : (
             <Sparkles size={16} />
           )}
-          {scope === 'staged' && preparing
+          {preparing
             ? '准备范围…'
-            : scope === 'staged' && running
-              ? '正在评审…'
-              : '评审本次提交'}
+            : running
+              ? actionScope === 'staged'
+                ? '正在评审…'
+                : '正在理解改动…'
+              : actionScope === 'staged'
+                ? '评审本次提交'
+                : '理解全部本地改动'}
         </button>
         {running && (
           <button className="text-button" onClick={() => void cancel()}>
@@ -266,14 +284,10 @@ export function ReviewPanel({
           </button>
         )}
       </div>
-      {!staged ? (
-        <p className="field-help review-hint">可先理解全部改动；评审本次提交需要暂存文件</p>
-      ) : (
-        !settings?.baseUrl && (
-          <button className="text-button" onClick={onSettings}>
-            配置模型服务
-          </button>
-        )
+      {!settings?.baseUrl && (
+        <button className="text-button" onClick={onSettings}>
+          配置模型服务
+        </button>
       )}
       {(error || review?.error) && (
         <p className="review-error" role="alert">
@@ -298,7 +312,12 @@ export function ReviewPanel({
               ? '重新评审中 · 保留上次结果'
               : stale
                 ? '结果已过期'
-                : latest.skipped.length || latest.unverifiedCount || latest.contextSkipped?.length
+                : latest.partialFiles?.length ||
+                    latest.skipped.length ||
+                    latest.unverifiedCount ||
+                    latest.contextSkipped?.length ||
+                    latest.investigation?.stats.truncated ||
+                    latest.investigation?.stats.skipped
                   ? '评审完成 · 部分覆盖'
                   : '评审完成'}
             <span>
@@ -317,7 +336,7 @@ export function ReviewPanel({
           </p>
           {!workspaceOpen && (
             <button className="secondary review-open-workspace" onClick={onOpen}>
-              查看审查结果
+              查看改动图解
               <ArrowRight size={16} />
             </button>
           )}
@@ -362,83 +381,6 @@ export function ReviewPanel({
           </label>
         </div>
       </details>
-      {preview && (
-        <Modal
-          title={preview.scope === 'local' ? '发送全部本地改动分析' : '发送本次提交评审'}
-          onClose={() => setPreview(null)}
-        >
-          <p className="dialog-subtitle">
-            将以下固定差异、相关代码片段与所填规范、需求发送给你的模型服务。
-          </p>
-          <div className="review-destination">
-            <strong>{preview.model}</strong>
-            <span>{preview.baseUrl}</span>
-            <small>
-              {preview.branch} · {preview.scope === 'local' ? '工作区快照' : '暂存树'}{' '}
-              {preview.tree.slice(0, 8)} · 约 {preview.chars.toLocaleString()} 字符
-            </small>
-          </div>
-          <div className="preview-file-list">
-            {preview.included.map((file) => (
-              <div key={file.path}>
-                <span>{file.path}</span>
-                <small>{file.chars.toLocaleString()} 字符</small>
-              </div>
-            ))}
-          </div>
-          <details className="review-coverage" open>
-            <summary>相关上下文 {preview.contexts.length} 段</summary>
-            {preview.contexts.map((item, index) => (
-              <p key={index}>
-                {item.path}:{item.startLine}–{item.endLine}
-                <small>
-                  {item.side === 'new'
-                    ? preview.scope === 'local'
-                      ? '工作区快照'
-                      : '暂存树'
-                    : '父版本'}{' '}
-                  {item.revision.slice(0, 8)} · {item.kind} · {item.chars} 字符
-                </small>
-              </p>
-            ))}
-            <p className="field-help">{preview.contextLimitation}</p>
-            {preview.contextSkipped.map((item, index) => (
-              <p key={index}>
-                {item.path}
-                <small>{item.reason}</small>
-              </p>
-            ))}
-          </details>
-          {preview.skipped.length > 0 && (
-            <details className="review-coverage" open>
-              <summary>{preview.skipped.length} 个文件不会发送</summary>
-              {preview.skipped.map((file) => (
-                <p key={file.path}>
-                  {file.path}
-                  <small>{file.reason}</small>
-                </p>
-              ))}
-            </details>
-          )}
-          <p className="dialog-note">
-            {preview.hasRequirements ? '包含填写的需求' : '未核对需求'} ·{' '}
-            {preview.hasStandards ? '包含填写的规范' : '通用正确性评审'} ·
-            不运行检查。模型调用可能产生费用。
-          </p>
-          <div className="dialog-actions">
-            <button className="secondary" onClick={() => setPreview(null)}>
-              返回
-            </button>
-            <button
-              className="primary"
-              disabled={!preview.included.length}
-              onClick={() => void start()}
-            >
-              发送并评审
-            </button>
-          </div>
-        </Modal>
-      )}
     </section>
   );
 }
