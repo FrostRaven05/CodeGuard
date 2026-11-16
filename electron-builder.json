@@ -7,6 +7,10 @@
   "files": ["dist/**/*", "electron/**/*.cjs", "electron/assets/**/*", "package.json"],
   "asar": true,
   "npmRebuild": false,
+  "publish": {
+    "provider": "generic",
+    "url": "https://codereview.frostraven05.com/updates/"
+  },
   "win": {
     "icon": "electron/assets/codeguard.ico",
     "target": [

@@ -1,3 +1,21 @@
+export interface UpdateState {
+  status:
+    | 'idle'
+    | 'unsupported'
+    | 'checking'
+    | 'available'
+    | 'current'
+    | 'downloading'
+    | 'downloaded'
+    | 'installing'
+    | 'error';
+  currentVersion: string;
+  version: string | null;
+  percent: number;
+  portable: boolean;
+  message: string;
+}
+
 export interface Repository {
   id: string;
   name: string;
@@ -126,6 +144,11 @@ export interface GeneratedCommitMessage {
   totalTokens: number | null;
 }
 export type ApiMethod =
+  | 'updateState'
+  | 'checkForUpdates'
+  | 'downloadUpdate'
+  | 'installUpdate'
+  | 'openUpdateDownload'
   | 'remoteSettings'
   | 'changeRemote'
   | 'operationOptions'

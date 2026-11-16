@@ -1,4 +1,6 @@
-const { app, dialog, Menu } = require('electron');
+const { app, dialog, Menu, shell } = require('electron');
+const { autoUpdater } = require('electron-updater');
+const { UpdateService } = require('./update-service.cjs');
 const path = require('node:path');
 const { GitService } = require('./git-service.cjs');
 const { createWorkbenchWindow } = require('./workbench-window.cjs');
@@ -28,9 +30,18 @@ else {
         }
       }
       Menu.setApplicationMenu(null);
+      const updates = new UpdateService({
+        app,
+        updater: autoUpdater,
+        shell,
+        portable: Boolean(process.env.PORTABLE_EXECUTABLE_DIR),
+      });
       window = await createWorkbenchWindow(service, {
         developmentUrl: process.env.CODEGUARD_DEV_URL,
+        updates,
       });
+      updates.start();
+      app.on('before-quit', () => updates.dispose());
     })
     .catch((error) => {
       dialog.showErrorBox('CodeGuard 无法启动', error.message);

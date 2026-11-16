@@ -1,6 +1,11 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const methods = [
+  'updateState',
+  'checkForUpdates',
+  'downloadUpdate',
+  'installUpdate',
+  'openUpdateDownload',
   'remoteSettings',
   'changeRemote',
   'operationOptions',

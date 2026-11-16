@@ -7,7 +7,7 @@ const { ReviewService } = require('./review-service.cjs');
 
 async function createWorkbenchWindow(
   service,
-  { developmentUrl, visible = true, chooseDirectory, reviews } = {},
+  { developmentUrl, visible = true, chooseDirectory, reviews, updates } = {},
 ) {
   if (developmentUrl && developmentUrl !== 'http://127.0.0.1:5173')
     throw new Error('Invalid development URL');
@@ -67,6 +67,7 @@ async function createWorkbenchWindow(
         return result.canceled ? null : result.filePaths[0];
       }),
     reviews,
+    updates,
   );
   ipcMain.handle('codeguard:invoke', async (event, method, args) => {
     const url = event.senderFrame?.url;

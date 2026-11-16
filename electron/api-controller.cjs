@@ -13,9 +13,22 @@ function text(value, limit = 200_000) {
   return value;
 }
 
-function createHandlers(service, chooseDirectory, reviews) {
+function createHandlers(service, chooseDirectory, reviews, updates) {
   const operations = new GitOperations(service);
   return {
+    updateState: () =>
+      updates?.state() || {
+        status: 'unsupported',
+        currentVersion: '',
+        message: '临时预览不支持更新。',
+        version: null,
+        percent: 0,
+        portable: false,
+      },
+    checkForUpdates: () => updates?.check(),
+    downloadUpdate: () => updates?.download(),
+    installUpdate: () => updates?.install(),
+    openUpdateDownload: () => updates?.openDownload(),
     remoteSettings: (id) => operations.remoteSettings(identifier(id)),
     changeRemote: (id, request) => operations.changeRemote(identifier(id), request),
     operationOptions: (id) => operations.options(identifier(id)),

@@ -1,4 +1,5 @@
 import type {
+  UpdateState,
   HistoryPage,
   HistoryQuery,
   ReviewScope,
@@ -62,6 +63,11 @@ async function request<T>(method: ApiMethod, ...args: unknown[]): Promise<T> {
 }
 
 export const api = {
+  updateState: () => request<UpdateState>('updateState'),
+  checkForUpdates: () => request<UpdateState>('checkForUpdates'),
+  downloadUpdate: () => request<UpdateState>('downloadUpdate'),
+  installUpdate: () => request<UpdateState>('installUpdate'),
+  openUpdateDownload: () => request<UpdateState>('openUpdateDownload'),
   remoteSettings: (id: string) => request<RemoteSettings>('remoteSettings', id),
   changeRemote: (id: string, change: RemoteChange) =>
     request<RemoteSettings>('changeRemote', id, change),

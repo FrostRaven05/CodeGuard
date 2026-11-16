@@ -40,6 +40,7 @@ import { BranchMenu } from './BranchMenu';
 import { GitOperationDialog, operationLabels } from './GitOperationDialog';
 import { CommitMessageComposer } from './CommitMessageComposer';
 import { RemoteSettingsDialog } from './RemoteSettingsDialog';
+import { UpdateButton } from './UpdateButton';
 import type {
   Branch,
   ReviewScope,
@@ -685,6 +686,7 @@ export function App() {
             <Settings2 size={15} />
             <span className="toolbar-extra-label">模型设置</span>
           </button>
+          <UpdateButton disabled={!!busy} />
         </div>
       </header>
 
